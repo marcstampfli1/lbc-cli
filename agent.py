@@ -54,7 +54,11 @@ SYSTEM_PROMPT = (
     'this directory. Do not list "/" unless explicitly asked.\n\n'
 ) + """Available tools:
   - read_file(path: str)
-  - write_file(path: str, content: str)
+  - write_file(path: str, content: str)              # creates or overwrites
+  - edit_file(path: str, old_string: str, new_string: str, replace_all?: bool)
+       finds old_string in the file (must be unique unless replace_all=true)
+       and replaces it with new_string. Use this for small/targeted edits
+       instead of rewriting the whole file with write_file.
   - list_dir(path: str)
   - run_bash(command: str)
 
@@ -90,6 +94,20 @@ def tool_write_file(path, content):
     p.write_text(content)
     return f"wrote {len(content)} bytes to {p}"
 
+def tool_edit_file(path, old_string, new_string, replace_all=False):
+    p = Path(path).expanduser()
+    text = p.read_text()
+    count = text.count(old_string)
+    if count == 0:
+        return f"ERROR: old_string not found in {p}"
+    if count > 1 and not replace_all:
+        return (f"ERROR: old_string appears {count} times in {p} — provide more "
+                "surrounding context to make it unique, or pass replace_all=true")
+    new_text = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+    p.write_text(new_text)
+    n = count if replace_all else 1
+    return f"edited {p} ({n} replacement{'s' if n != 1 else ''})"
+
 def tool_list_dir(path):
     entries = sorted(os.listdir(Path(path).expanduser()))
     return "\n".join(entries) if entries else "(empty)"
@@ -104,6 +122,7 @@ def tool_run_bash(command):
 DISPATCH = {
     "read_file": tool_read_file,
     "write_file": tool_write_file,
+    "edit_file": tool_edit_file,
     "list_dir": tool_list_dir,
     "run_bash": tool_run_bash,
 }
@@ -223,8 +242,11 @@ class LibreChatBackend:
 
         state = json.loads(Path(SESSION_FILE).read_text())
         jar = httpx.Cookies()
+        from urllib.parse import urlparse
+        default_host = urlparse(LIBRECHAT_URL).hostname or "localhost"
         for c in state.get("cookies", []):
-            jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+            domain = (c.get("domain") or "").lstrip(".") or default_host
+            jar.set(c["name"], c["value"], domain=domain, path=c.get("path") or "/")
         token = state.get("token") or _find_token_in_storage(state)
         if not token:
             raise RuntimeError("no JWT in session.json — re-run login")
@@ -246,10 +268,16 @@ class LibreChatBackend:
     def _refresh_token(self):
         # /api/auth/refresh exchanges the refreshToken cookie for a new access token
         r = self.client.post("/api/auth/refresh")
-        r.raise_for_status()
-        new_token = r.json()["token"]
+        if not r.is_success:
+            raise RuntimeError(
+                f"refresh failed (HTTP {r.status_code}). The refreshToken cookie "
+                f"is probably expired — re-run a login command (cli-agent login).")
+        try:
+            new_token = r.json()["token"]
+        except (json.JSONDecodeError, KeyError) as e:
+            raise RuntimeError(
+                f"refresh returned unexpected body: {r.text[:200]} — re-run a login command.") from e
         self.client.headers["Authorization"] = f"Bearer {new_token}"
-        # persist for the next session
         state = json.loads(Path(SESSION_FILE).read_text())
         state["token"] = new_token
         Path(SESSION_FILE).write_text(json.dumps(state, indent=2))
@@ -348,10 +376,65 @@ class LibreChatBackend:
 
 # --- chat session persistence ---
 import argparse
+import difflib
 import signal
 import time
 import uuid
 from datetime import datetime
+
+
+# --- diff rendering for file edits ---
+_ANSI = sys.stdout.isatty()
+_C = {"red": "\x1b[31m", "green": "\x1b[32m", "cyan": "\x1b[36m",
+      "bold": "\x1b[1m", "reset": "\x1b[0m"} if _ANSI else \
+     {k: "" for k in ("red", "green", "cyan", "bold", "reset")}
+
+
+def _render_diff(old_text, new_text, path, max_lines=120):
+    if old_text == new_text:
+        return None
+    raw = list(difflib.unified_diff(
+        old_text.splitlines(keepends=False),
+        new_text.splitlines(keepends=False),
+        fromfile=f"a/{path}", tofile=f"b/{path}", n=3, lineterm="",
+    ))
+    out = []
+    for line in raw:
+        if line.startswith("+++") or line.startswith("---"):
+            out.append(f"{_C['bold']}{line}{_C['reset']}")
+        elif line.startswith("@@"):
+            out.append(f"{_C['cyan']}{line}{_C['reset']}")
+        elif line.startswith("+"):
+            out.append(f"{_C['green']}{line}{_C['reset']}")
+        elif line.startswith("-"):
+            out.append(f"{_C['red']}{line}{_C['reset']}")
+        else:
+            out.append(line)
+    if len(out) > max_lines:
+        out = out[:max_lines] + [f"{_C['cyan']}... ({len(raw) - max_lines} more diff lines){_C['reset']}"]
+    return "\n".join(out)
+
+
+def _show_diff_for(name, ar):
+    """Print a diff preview if this tool call would change a file's contents."""
+    path_str = ar.get("path") if isinstance(ar, dict) else None
+    if not path_str:
+        return
+    p = Path(path_str).expanduser()
+    old = p.read_text() if p.exists() else ""
+    if name == "write_file":
+        new = ar.get("content", "")
+    elif name == "edit_file":
+        old_s = ar.get("old_string", "")
+        new_s = ar.get("new_string", "")
+        if not old_s or old_s not in old:
+            return  # tool will error itself; don't pretend to diff
+        new = old.replace(old_s, new_s) if ar.get("replace_all") else old.replace(old_s, new_s, 1)
+    else:
+        return
+    diff = _render_diff(old, new, path_str)
+    if diff:
+        print(diff)
 
 CHATS_DIR = CONFIG_DIR / "chats"
 
@@ -371,7 +454,7 @@ signal.signal(signal.SIGINT, _sigint_handler)
 # auto-edit: ask before run_bash, edits go through silently
 # yolo:      ask for nothing
 _TOOLS_NEEDING_CONFIRM = {
-    "safe": {"run_bash", "write_file"},
+    "safe": {"run_bash", "write_file", "edit_file"},
     "auto-edit": {"run_bash"},
     "yolo": set(),
 }
@@ -581,6 +664,8 @@ def main():
                     if name == "__PARSE_ERROR__":
                         results.append(f"<tool_response>parse error: {ar.get('error')}</tool_response>")
                         continue
+                    if name in ("write_file", "edit_file"):
+                        _show_diff_for(name, ar)
                     decision = confirm(name, ar)
                     if decision != "y":
                         print(f"  [skip] {name}")

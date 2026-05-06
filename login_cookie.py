@@ -44,8 +44,10 @@ with httpx.Client(base_url=URL, timeout=30.0,
     body = r.json()
     token = body["token"]
 
+from urllib.parse import urlparse
+host = urlparse(URL).hostname or "localhost"
 state = {
-    "cookies": [{"name": "refreshToken", "value": refresh_token, "domain": "", "path": "/"}],
+    "cookies": [{"name": "refreshToken", "value": refresh_token, "domain": host, "path": "/"}],
     "token": token,
     "origins": [],
 }

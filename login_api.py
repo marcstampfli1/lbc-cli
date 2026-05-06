@@ -27,13 +27,16 @@ if not URL:
 email = os.environ.get("LIBRECHAT_EMAIL") or input("email: ")
 password = os.environ.get("LIBRECHAT_PASSWORD") or getpass.getpass("password: ")
 
+from urllib.parse import urlparse
+host = urlparse(URL).hostname or "localhost"
+
 with httpx.Client(base_url=URL, timeout=30.0) as c:
     r = c.post("/api/auth/login", json={"email": email, "password": password})
     r.raise_for_status()
     body = r.json()
     token = body["token"]
     cookies = [
-        {"name": k, "value": v, "domain": "", "path": "/"}
+        {"name": k, "value": v, "domain": host, "path": "/"}
         for k, v in c.cookies.items()
     ]
 

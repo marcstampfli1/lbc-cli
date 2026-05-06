@@ -1,0 +1,16 @@
+# secrets / runtime state
+.env
+session.json
+chats/
+captured_payload.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""CLI agent. Two backends, same ReAct loop:
+  - LIBRECHAT_URL set  -> talks to LibreChat's REST API using cookies from session.json
+  - OPENAI_BASE_URL set -> talks to any OpenAI-compatible endpoint (e.g. local Ollama)
+ReAct prompting (Qwen2.5 native <tool_call> format) — works regardless of whether
+the backend supports OpenAI tool definitions.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+
+# tolerate bad bytes from terminal pastes / non-UTF-8 locales
+for s in (sys.stdin, sys.stdout):
+    try:
+        s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+CONFIG_DIR = Path(os.environ.get("CLI_AGENT_CONFIG_DIR") or
+                  Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cli-agent")
+_env_file = CONFIG_DIR / ".env"
+load_dotenv(_env_file if _env_file.exists() else None)
+
+LIBRECHAT_URL = os.environ.get("LIBRECHAT_URL", "").rstrip("/")
+LIBRECHAT_MODEL = os.environ.get("LIBRECHAT_MODEL", "")
+LIBRECHAT_ENDPOINT = os.environ.get("LIBRECHAT_ENDPOINT", "")  # body field, e.g. "Ollama" or "openAI"
+LIBRECHAT_ENDPOINT_TYPE = os.environ.get("LIBRECHAT_ENDPOINT_TYPE", "")  # URL path, e.g. "custom" or "openAI"
+SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
+if not Path(SESSION_FILE).is_absolute():
+    SESSION_FILE = str(CONFIG_DIR / SESSION_FILE)
+
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "qwen2.5:3b")
+
+TOOL_REMINDER = (
+    "REMINDER: you have real tools that execute on the user's machine. "
+    "To do anything, emit a <tool_call>...</tool_call> block. "
+    "DO NOT write bash code blocks for the user to copy-run — they will not be executed. "
+    "DO NOT just describe steps. Call the tool yourself."
+)
+
+SYSTEM_PROMPT = (
+    "You are a CLI coding agent in the user's terminal.\n"
+    f"Your current working directory is: {os.getcwd()}\n"
+    'When the user says "this folder", "here", or uses relative paths, they mean\n'
+    'this directory. Do not list "/" unless explicitly asked.\n\n'
+) + """Available tools:
+  - read_file(path: str)
+  - write_file(path: str, content: str)
+  - list_dir(path: str)
+  - run_bash(command: str)
+
+To call a tool, emit ONLY this block (nothing before or after):
+
+<tool_call>
+{"name": "TOOL_NAME", "arguments": {"ARG": "VALUE"}}
+</tool_call>
+
+Then STOP. The user will reply with the result wrapped in <tool_response>...</tool_response>.
+After receiving the result, call another tool or give the final plain-text answer.
+
+Example:
+User: what's in /etc/hostname?
+Assistant: <tool_call>
+{"name": "read_file", "arguments": {"path": "/etc/hostname"}}
+</tool_call>
+User: <tool_response>
+parrot
+</tool_response>
+Assistant: The hostname is "parrot".
+
+Be concise. Stop and ask before destructive actions (rm -rf, dropping data, force pushes)."""
+
+
+# --- tools ---
+def tool_read_file(path):
+    return Path(path).expanduser().read_text()
+
+def tool_write_file(path, content):
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return f"wrote {len(content)} bytes to {p}"
+
+def tool_list_dir(path):
+    entries = sorted(os.listdir(Path(path).expanduser()))
+    return "\n".join(entries) if entries else "(empty)"
+
+def tool_run_bash(command):
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "ERROR: command timed out after 60s"
+    return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}--- stderr ---\n{r.stderr}"
+
+DISPATCH = {
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "list_dir": tool_list_dir,
+    "run_bash": tool_run_bash,
+}
+
+def call_tool(name, args):
+    try:
+        return DISPATCH[name](**args)
+    except KeyError:
+        return f"ERROR: unknown tool '{name}'"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+# --- ReAct parsing ---
+TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+def _parse_call(raw):
+    obj = json.loads(raw)
+    args = obj.get("arguments", obj.get("args", {}))
+    return obj["name"], args if isinstance(args, dict) else {}
+
+def _find_balanced_json_objects(text):
+    """Yield substrings of `text` that are top-level balanced {...} blocks."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if esc:
+            esc = False; continue
+        if ch == "\\" and in_str:
+            esc = True; continue
+        if ch == '"':
+            in_str = not in_str; continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start != -1:
+                yield text[start:i+1]
+                start = -1
+
+def extract_tool_calls(text):
+    calls = []
+    matches = list(TOOL_RE.finditer(text))
+    if matches:
+        for m in matches:
+            try:
+                calls.append(_parse_call(m.group(1)))
+            except (json.JSONDecodeError, KeyError) as e:
+                calls.append(("__PARSE_ERROR__", {"raw": m.group(1), "error": str(e)}))
+        return calls
+    # fallback: any balanced {...} that parses to an object with "name"
+    for raw in _find_balanced_json_objects(text):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "name" in obj and ("arguments" in obj or "args" in obj):
+            calls.append(_parse_call(raw))
+    return calls
+
+
+# --- backends ---
+class OpenAIBackend:
+    def __init__(self):
+        from openai import OpenAI
+        self.client = OpenAI(base_url=OPENAI_BASE_URL or None, api_key=OPENAI_API_KEY)
+        self.model = AGENT_MODEL
+
+    def send_stream(self, messages):
+        """Yield text chunks. Caller accumulates."""
+        stream = self.client.chat.completions.create(
+            model=self.model, messages=messages, stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                yield delta
+
+
+def _find_token_in_storage(state):
+    """Playwright's storage_state() puts localStorage under 'origins'. LibreChat
+    stores the JWT under various keys depending on version — scan for it."""
+    for origin in state.get("origins", []):
+        for item in origin.get("localStorage", []):
+            v = item.get("value", "")
+            if v.startswith("eyJ"):  # JWTs always start with this
+                return v.strip('"')
+            try:
+                obj = json.loads(v)
+                for key in ("token", "accessToken", "jwt"):
+                    if isinstance(obj, dict) and isinstance(obj.get(key), str) and obj[key].startswith("eyJ"):
+                        return obj[key]
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return None
+
+
+class LibreChatBackend:
+    """Talks to LibreChat's internal REST API using session cookies from login.py.
+
+    LibreChat manages conversation state server-side: we track conversationId and
+    parentMessageId between turns. System prompt is prepended to the first user
+    message since /api/ask/* doesn't take a separate system message field reliably
+    across versions."""
+
+    def __init__(self):
+        if not all([LIBRECHAT_URL, LIBRECHAT_MODEL, LIBRECHAT_ENDPOINT]):
+            raise RuntimeError("LIBRECHAT_URL, LIBRECHAT_MODEL, LIBRECHAT_ENDPOINT must all be set in .env")
+        if not Path(SESSION_FILE).exists():
+            raise RuntimeError(f"{SESSION_FILE} missing — run login.py first")
+
+        state = json.loads(Path(SESSION_FILE).read_text())
+        jar = httpx.Cookies()
+        for c in state.get("cookies", []):
+            jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+        token = state.get("token") or _find_token_in_storage(state)
+        if not token:
+            raise RuntimeError("no JWT in session.json — re-run login")
+        self.client = httpx.Client(
+            base_url=LIBRECHAT_URL,
+            cookies=jar,
+            timeout=httpx.Timeout(180.0, connect=10.0),
+            headers={
+                # LibreChat's uaParser middleware rejects non-browser User-Agents
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        self.conversation_id = None
+        self.parent_message_id = "00000000-0000-0000-0000-000000000000"
+        self._first_turn = True
+
+    def _refresh_token(self):
+        # /api/auth/refresh exchanges the refreshToken cookie for a new access token
+        r = self.client.post("/api/auth/refresh")
+        r.raise_for_status()
+        new_token = r.json()["token"]
+        self.client.headers["Authorization"] = f"Bearer {new_token}"
+        # persist for the next session
+        state = json.loads(Path(SESSION_FILE).read_text())
+        state["token"] = new_token
+        Path(SESSION_FILE).write_text(json.dumps(state, indent=2))
+
+    def send_stream(self, messages):
+        """Yield text deltas as the model generates. LibreChat events sometimes
+        carry the cumulative text rather than a delta — we diff against what we've
+        seen so far either way."""
+        latest_user = next(m for m in reversed(messages) if m["role"] == "user")
+        text = latest_user["content"]
+        if self._first_turn and messages and messages[0]["role"] == "system":
+            text = messages[0]["content"] + "\n\n---\n\n" + text
+            self._first_turn = False
+
+        msg_id = str(uuid.uuid4())
+        from datetime import datetime, timezone
+        payload = {
+            "text": text,
+            "sender": "User",
+            "clientTimestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "isCreatedByUser": True,
+            "parentMessageId": self.parent_message_id,
+            "messageId": msg_id,
+            "error": False,
+            "endpoint": LIBRECHAT_ENDPOINT,
+            "model": LIBRECHAT_MODEL,
+            "key": "never",
+            "isTemporary": False,
+            "isRegenerate": False,
+            "isContinued": False,
+        }
+        if LIBRECHAT_ENDPOINT_TYPE:
+            payload["endpointType"] = LIBRECHAT_ENDPOINT_TYPE
+        if self.conversation_id:
+            payload["conversationId"] = self.conversation_id
+
+        url = f"/api/agents/chat/{LIBRECHAT_ENDPOINT}"
+        r = self.client.post(url, json=payload)
+        if r.status_code == 401:
+            self._refresh_token()
+            r = self.client.post(url, json=payload)
+        r.raise_for_status()
+        init = r.json()
+        stream_id = init["streamId"]
+        self.conversation_id = init.get("conversationId", self.conversation_id)
+
+        seen_text = ""
+        final_event = None
+        with self.client.stream(
+            "GET", f"/api/agents/chat/stream/{stream_id}",
+            headers={"Accept": "text/event-stream"},
+        ) as sr:
+            sr.raise_for_status()
+            for raw in sr.iter_lines():
+                if not raw or not raw.startswith("data:"):
+                    continue
+                try:
+                    obj = json.loads(raw[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("final"):
+                    final_event = obj
+                    break
+                # interim chunks: 'text' may be cumulative or a delta
+                t = obj.get("text")
+                if isinstance(t, str) and t:
+                    if t.startswith(seen_text):
+                        delta = t[len(seen_text):]
+                        seen_text = t
+                    else:
+                        delta = t
+                        seen_text += t
+                    if delta:
+                        yield delta
+
+        if final_event:
+            resp = final_event.get("responseMessage") or {}
+            self.parent_message_id = resp.get("messageId", self.parent_message_id)
+            final_text = resp.get("text") or ""
+            if not final_text:
+                for part in resp.get("content", []) or []:
+                    if part.get("type") == "text":
+                        final_text += part.get("text", "")
+                    elif part.get("type") == "error":
+                        final_text = f"[LibreChat error] {part.get('error')}"
+            # if we streamed less than the final, emit the remainder
+            if final_text.startswith(seen_text):
+                tail = final_text[len(seen_text):]
+                if tail:
+                    yield tail
+            elif not seen_text and final_text:
+                yield final_text
+
+
+# --- chat session persistence ---
+import argparse
+import signal
+import time
+import uuid
+from datetime import datetime
+
+CHATS_DIR = CONFIG_DIR / "chats"
+
+# --- ctrl-c double-tap: single = interrupt, double (within 1.5s) = exit ---
+_last_sigint = [0.0]
+def _sigint_handler(signum, frame):
+    now = time.monotonic()
+    if now - _last_sigint[0] < 1.5:
+        print("\n(double Ctrl-C — exiting)")
+        os._exit(130)
+    _last_sigint[0] = now
+    raise KeyboardInterrupt
+signal.signal(signal.SIGINT, _sigint_handler)
+
+# --- permission modes ---
+# safe:      ask before run_bash and write_file
+# auto-edit: ask before run_bash, edits go through silently
+# yolo:      ask for nothing
+_TOOLS_NEEDING_CONFIRM = {
+    "safe": {"run_bash", "write_file"},
+    "auto-edit": {"run_bash"},
+    "yolo": set(),
+}
+
+
+def _list_chats():
+    if not CHATS_DIR.exists():
+        return []
+    items = []
+    for f in CHATS_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+            items.append({
+                "id": f.stem,
+                "name": data.get("name") or "(unnamed)",
+                "updated_at": data.get("updated_at", ""),
+                "turns": sum(1 for m in data.get("messages", []) if m.get("role") == "user"),
+            })
+        except (json.JSONDecodeError, OSError):
+            pass
+    return sorted(items, key=lambda x: x["updated_at"], reverse=True)
+
+
+def _find_chat(spec):
+    items = _list_chats()
+    if not items:
+        return None
+    if not spec:
+        return items[0]
+    by_id = next((i for i in items if i["id"] == spec), None)
+    if by_id:
+        return by_id
+    return next((i for i in items if spec.lower() in i["name"].lower()), None)
+
+
+def _new_chat():
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "name": None,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
+        "conversation_id": None,
+        "parent_message_id": "00000000-0000-0000-0000-000000000000",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _save_chat(chat):
+    chat["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    (CHATS_DIR / f"{chat['id']}.json").write_text(json.dumps(chat, indent=2))
+
+
+# --- agent loop ---
+def main():
+    parser = argparse.ArgumentParser(prog="cli-agent")
+    parser.add_argument("-r", "--resume", nargs="?", const="", default=None,
+                        metavar="NAME_OR_ID",
+                        help="resume a chat (most recent if no name given)")
+    parser.add_argument("-l", "--list-sessions", action="store_true",
+                        help="list saved chats and exit")
+    parser.add_argument("--mode", choices=["safe", "auto-edit", "yolo"],
+                        default=os.environ.get("CLI_AGENT_MODE", "safe"),
+                        help="permission level (default: safe)")
+    parser.add_argument("--yolo", action="store_true", help="alias for --mode yolo")
+    parser.add_argument("--reminder-every", type=int,
+                        default=int(os.environ.get("CLI_AGENT_REMINDER_EVERY", "0")),
+                        metavar="N",
+                        help="re-inject tool-use reminder every N user turns (0=off, default 0). "
+                             "Set to 3-5 if your model drifts into bash-block explanations.")
+    args = parser.parse_args()
+    if args.yolo:
+        args.mode = "yolo"
+    mode = args.mode
+
+    if args.list_sessions:
+        items = _list_chats()
+        if not items:
+            print("(no saved chats)")
+            return
+        for c in items:
+            print(f"{c['id']}  {c['updated_at'][:19]}  ({c['turns']} turns)  {c['name']}")
+        return
+
+    if args.resume is not None:
+        match = _find_chat(args.resume)
+        if not match:
+            sys.exit(f"no matching chat for '{args.resume}'")
+        chat = json.loads((CHATS_DIR / f"{match['id']}.json").read_text())
+        print(f"resumed chat {chat['id']}: {chat.get('name') or '(unnamed)'}  "
+              f"({sum(1 for m in chat['messages'] if m['role'] == 'user')} turns)")
+    else:
+        chat = _new_chat()
+
+    if LIBRECHAT_URL:
+        backend = LibreChatBackend()
+        backend.conversation_id = chat["conversation_id"]
+        backend.parent_message_id = chat["parent_message_id"]
+        # if resuming, system prompt already lives in chat['messages'] — don't re-inject
+        backend._first_turn = chat["conversation_id"] is None
+        print(f"agent ready (LibreChat={LIBRECHAT_URL}, model={LIBRECHAT_MODEL}, endpoint={LIBRECHAT_ENDPOINT})")
+    elif OPENAI_BASE_URL or os.environ.get("OPENAI_API_KEY"):
+        backend = OpenAIBackend()
+        print(f"agent ready (OpenAI-compat={OPENAI_BASE_URL or 'default'}, model={AGENT_MODEL})")
+    else:
+        sys.exit("no backend configured — set LIBRECHAT_URL or OPENAI_BASE_URL in .env")
+    print(f"chat id: {chat['id']}  mode: {mode}  (Ctrl-C twice to quit, /help for commands)\n")
+
+    def confirm(name, ar):
+        """Returns 'y' to allow once, 'a' to allow all, 'n' to skip."""
+        nonlocal mode
+        if name not in _TOOLS_NEEDING_CONFIRM[mode]:
+            return "y"
+        preview = json.dumps(ar)[:200]
+        print(f"\n  [ASK] {name}({preview})")
+        ans = input("  allow? [y]es / [n]o / [a]ll-from-now / [q]uit: ").strip().lower()
+        if ans == "a":
+            mode = "yolo"
+            return "y"
+        if ans == "q":
+            raise SystemExit(0)
+        return "y" if ans == "y" else "n"
+
+    messages = chat["messages"]
+    while True:
+        try:
+            user = input("> ").strip()
+        except EOFError:
+            print(); return
+        except KeyboardInterrupt:
+            # at the prompt, single Ctrl-C clears the line; double-tap is handled by handler
+            print(); continue
+        if not user:
+            continue
+
+        if user.startswith("/"):
+            cmd, _, rest = user[1:].partition(" ")
+            if cmd in ("exit", "quit"):
+                return
+            if cmd == "help":
+                print("  /name <name>   rename current chat\n"
+                      "  /list          list chats\n"
+                      "  /id            show this chat's id\n"
+                      "  /mode <m>      change permission mode (safe|auto-edit|yolo)\n"
+                      "  /exit          quit")
+                continue
+            if cmd == "name":
+                chat["name"] = rest.strip() or chat["name"]
+                _save_chat(chat); print(f"named: {chat['name']}"); continue
+            if cmd == "list":
+                for c in _list_chats():
+                    print(f"  {c['id']}  ({c['turns']}t)  {c['name']}")
+                continue
+            if cmd == "id":
+                print(f"  {chat['id']}"); continue
+            if cmd == "mode":
+                m = rest.strip()
+                if m in _TOOLS_NEEDING_CONFIRM:
+                    mode = m; print(f"mode: {mode}")
+                else:
+                    print(f"current mode: {mode} (options: safe, auto-edit, yolo)")
+                continue
+            print("(unknown command — try /help)"); continue
+
+        if not chat["name"]:
+            chat["name"] = user[:60]
+        chat["turn_count"] = chat.get("turn_count", 0) + 1
+        messages.append({"role": "user", "content": user})
+
+        # build the messages we actually send — periodic tool-use reminder injected
+        # near the latest user message but NOT persisted to chat['messages']
+        send_messages = messages
+        if args.reminder_every > 0 and chat["turn_count"] % args.reminder_every == 0:
+            if isinstance(backend, LibreChatBackend):
+                # LibreChat backend only forwards the latest user message's text
+                send_messages = list(messages)
+                last = dict(send_messages[-1])
+                last["content"] = f"[{TOOL_REMINDER}]\n\n{last['content']}"
+                send_messages[-1] = last
+            else:
+                # OpenAI mode: send the full list with an extra system msg before the last user
+                send_messages = list(messages)
+                send_messages.insert(-1, {"role": "system", "content": TOOL_REMINDER})
+
+        try:
+            for _ in range(20):
+                # stream the assistant turn
+                assistant_text = ""
+                print()
+                for delta in backend.send_stream(send_messages):
+                    print(delta, end="", flush=True)
+                    assistant_text += delta
+                print()
+                messages.append({"role": "assistant", "content": assistant_text})
+                if isinstance(backend, LibreChatBackend):
+                    chat["conversation_id"] = backend.conversation_id
+                    chat["parent_message_id"] = backend.parent_message_id
+
+                calls = extract_tool_calls(assistant_text)
+                if not calls:
+                    print()
+                    break
+                results = []
+                for name, ar in calls:
+                    preview = {k: (v[:80] + "...") if isinstance(v, str) and len(v) > 80 else v
+                               for k, v in (ar.items() if isinstance(ar, dict) else [])}
+                    if name == "__PARSE_ERROR__":
+                        results.append(f"<tool_response>parse error: {ar.get('error')}</tool_response>")
+                        continue
+                    decision = confirm(name, ar)
+                    if decision != "y":
+                        print(f"  [skip] {name}")
+                        results.append(f"<tool_response>user declined to run {name}</tool_response>")
+                        continue
+                    print(f"  [tool] {name}({preview})")
+                    result = call_tool(name, ar)
+                    results.append(f"<tool_response>\n{result}\n</tool_response>")
+                messages.append({"role": "user", "content": "\n".join(results)})
+                # subsequent inner iterations send the un-augmented history
+                send_messages = messages
+            else:
+                print("(stopped: tool-call chain exceeded 20 iterations)")
+        except KeyboardInterrupt:
+            print("\n(interrupted — back to prompt; press Ctrl-C again quickly to exit)")
+            # rewind any half-saved assistant turn so the chat doesn't get a dangling reply
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            # also drop the user msg we appended this turn so retry feels clean
+            if messages and messages[-1]["role"] == "user":
+                messages.pop()
+
+        _save_chat(chat)
+
+
+if __name__ == "__main__":
+    main()

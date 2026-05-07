@@ -1011,6 +1011,7 @@ async def main_async():
     pending: "deque[str]" = deque()
     new_input_evt = asyncio.Event()
     busy = [False]
+    interrupt_flag = [False]    # Ctrl+C sets this; turn body checks between chunks/tools
     input_task_holder = [None]  # asyncio.Task
 
     # custom keybindings (Ctrl+O, Ctrl+B, Ctrl+C, Ctrl+J, arrow-up-recall)
@@ -1044,15 +1045,18 @@ async def main_async():
         is_double = (now - _last_sigint[0]) < 1.5
         _last_sigint[0] = now
         if is_double:
-            # double-tap: exit regardless of what state we were in
             event.app.exit(exception=KeyboardInterrupt)
             return
-        # single tap — priority: kill fg, else clear buffer, else hint
+        # single-tap priority: kill fg → interrupt agent → clear buffer → hint
         proc = _CURRENT_FG.get("proc")
         if proc is not None:
             try: proc.terminate()
             except Exception: pass
             _msg(event, "\n[Ctrl+C] terminated foreground command  (press again to exit)")
+            return
+        if busy[0]:
+            interrupt_flag[0] = True
+            _msg(event, "\n[Ctrl+C] interrupting agent...  (press again to exit)")
             return
         if event.current_buffer.text:
             event.current_buffer.reset()
@@ -1067,17 +1071,16 @@ async def main_async():
         if not busy[0]:
             event.app.exit(result="")
 
-    @kb.add("up")
+    @kb.add("up", eager=True)
     def _(event):
-        # if there's a queued message, recall the newest one into the buffer.
-        # otherwise fall through to history navigation
+        # if anything is queued, take the newest OUT of the queue and put it
+        # into the prompt buffer for editing. otherwise: normal history nav.
         if pending:
-            text = pending.pop()
-            buf = event.current_buffer
-            buf.text = text
-            buf.cursor_position = len(text)
-        else:
-            event.current_buffer.history_backward()
+            from prompt_toolkit.document import Document
+            text = pending.pop()  # rightmost = newest
+            event.current_buffer.document = Document(text=text, cursor_position=len(text))
+            return
+        event.current_buffer.history_backward()
 
     session = PromptSession(history=FileHistory(str(history_path)), key_bindings=kb)
 
@@ -1294,11 +1297,16 @@ async def main_async():
                         send_messages.insert(-1, {"role": "system", "content": TOOL_REMINDER})
 
                 busy[0] = True
+                interrupt_flag[0] = False
                 try:
                     for _ in range(20):
+                        if interrupt_flag[0]:
+                            raise KeyboardInterrupt
                         assistant_text = ""
                         print()
                         async for delta in _stream_to_async(backend.send_stream(send_messages)):
+                            if interrupt_flag[0]:
+                                raise KeyboardInterrupt
                             sys.stdout.write(delta); sys.stdout.flush()
                             assistant_text += delta
                         print()

@@ -5,10 +5,10 @@
 ReAct prompting (Qwen2.5 native <tool_call> format) — works regardless of whether
 the backend supports OpenAI tool definitions.
 """
+import asyncio
 import json
 import os
 import re
-import select
 import subprocess
 import sys
 import threading
@@ -17,8 +17,10 @@ import uuid
 from pathlib import Path
 
 import httpx
-import readline  # noqa: F401 — gives input() arrow-up history + line editing
 from dotenv import load_dotenv
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 
 # tolerate bad bytes from terminal pastes / non-UTF-8 locales
 for s in (sys.stdin, sys.stdout):
@@ -803,62 +805,12 @@ def _show_diff_for(name, ar):
 
 CHATS_DIR = CONFIG_DIR / "chats"
 
-# --- async input queue ---
-# Lets the user type messages while the agent is busy. Queued messages
-# auto-flush at the next turn boundary. /recall pops the newest queued back
-# into the prompt buffer for editing.
-_QUEUE = []                       # list[str] — queued user lines
-_QUEUE_LOCK = threading.Lock()
+# --- async input queue (filled by prompt_toolkit, drained by turn loop) ---
+# Lines submitted while the agent is busy pile up here. The turn loop pulls
+# from this queue on each new turn before falling through to a fresh prompt.
+_INPUT_QUEUE: "asyncio.Queue[str]" = None  # set in main_async
 _AGENT_BUSY = threading.Event()
-_RECALL_TEXT = [""]               # one-shot text to inject into next input()
-
-
-def _queue_reader_thread():
-    """Daemon: poll stdin while agent is busy, append non-empty lines to queue."""
-    while True:
-        if not _AGENT_BUSY.is_set():
-            time.sleep(0.05)
-            continue
-        try:
-            r, _, _ = select.select([sys.stdin], [], [], 0.2)
-        except OSError:
-            return
-        if not r or not _AGENT_BUSY.is_set():
-            continue
-        try:
-            line = sys.stdin.readline()
-        except (OSError, ValueError):
-            return
-        if not line:
-            return  # stdin closed
-        line = line.rstrip("\n").strip()
-        if not line:
-            continue
-        with _QUEUE_LOCK:
-            _QUEUE.append(line)
-            n = len(_QUEUE)
-        sys.stdout.write(f"\n  [queued #{n}: {line[:80]}{'...' if len(line) > 80 else ''}] "
-                         f"(/recall to edit, /queue to view)\n")
-        sys.stdout.flush()
-
-
-def _drain_queue_one():
-    with _QUEUE_LOCK:
-        if not _QUEUE:
-            return None
-        return _QUEUE.pop(0)
-
-
-def _readline_pre_input_hook():
-    """If text was set via /recall, pre-fill the next input() with it."""
-    if _RECALL_TEXT[0]:
-        readline.insert_text(_RECALL_TEXT[0])
-        readline.redisplay()
-        _RECALL_TEXT[0] = ""
-
-
-readline.set_pre_input_hook(_readline_pre_input_hook)
-threading.Thread(target=_queue_reader_thread, daemon=True).start()
+_RECALL_TEXT = [""]                          # one-shot text to pre-fill prompt
 
 # --- ctrl-c double-tap: single = interrupt, double (within 1.5s) = exit ---
 _last_sigint = [0.0]
@@ -930,8 +882,36 @@ def _save_chat(chat):
     (CHATS_DIR / f"{chat['id']}.json").write_text(json.dumps(chat, indent=2))
 
 
-# --- agent loop ---
-def main():
+# --- async stream bridge: sync generator → async iterator ---
+async def _stream_to_async(sync_iter):
+    """Run a sync generator in a thread, yield its items in async land."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    DONE = object()
+
+    def runner():
+        try:
+            for chunk in sync_iter:
+                loop.call_soon_threadsafe(q.put_nowait, chunk)
+        except BaseException as e:  # propagate including KeyboardInterrupt
+            loop.call_soon_threadsafe(q.put_nowait, ("error", e))
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, DONE)
+
+    threading.Thread(target=runner, daemon=True).start()
+    while True:
+        item = await q.get()
+        if item is DONE:
+            return
+        if isinstance(item, tuple) and item and item[0] == "error":
+            raise item[1]
+        yield item
+
+
+# --- agent loop (async, prompt_toolkit-driven) ---
+async def main_async():
+    from collections import deque
+
     parser = argparse.ArgumentParser(prog="cli-agent")
     parser.add_argument("-r", "--resume", nargs="?", const="", default=None,
                         metavar="NAME_OR_ID",
@@ -945,8 +925,7 @@ def main():
     parser.add_argument("--reminder-every", type=int,
                         default=int(os.environ.get("CLI_AGENT_REMINDER_EVERY", "0")),
                         metavar="N",
-                        help="re-inject tool-use reminder every N user turns (0=off, default 0). "
-                             "Set to 3-5 if your model drifts into bash-block explanations.")
+                        help="re-inject tool-use reminder every N user turns (0=off, default 0).")
     args = parser.parse_args()
     if args.yolo:
         args.mode = "yolo"
@@ -955,8 +934,7 @@ def main():
     if args.list_sessions:
         items = _list_chats()
         if not items:
-            print("(no saved chats)")
-            return
+            print("(no saved chats)"); return
         for c in items:
             print(f"{c['id']}  {c['updated_at'][:19]}  ({c['turns']} turns)  {c['name']}")
         return
@@ -975,7 +953,6 @@ def main():
         backend = LibreChatBackend()
         backend.conversation_id = chat["conversation_id"]
         backend.parent_message_id = chat["parent_message_id"]
-        # if resuming, system prompt already lives in chat['messages'] — don't re-inject
         backend._first_turn = chat["conversation_id"] is None
         print(f"agent ready (LibreChat={LIBRECHAT_URL}, model={LIBRECHAT_MODEL}, endpoint={LIBRECHAT_ENDPOINT})")
     elif OPENAI_BASE_URL or os.environ.get("OPENAI_API_KEY"):
@@ -985,224 +962,245 @@ def main():
         sys.exit("no backend configured — set LIBRECHAT_URL or OPENAI_BASE_URL in .env")
     print(f"chat id: {chat['id']}  mode: {mode}  (Ctrl-C twice to quit, /help for commands)\n")
 
-    def confirm(name, ar):
-        """Returns 'y' to allow once, 'a' to allow all, 'n' to skip."""
+    history_path = CONFIG_DIR / "input_history"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    session = PromptSession(history=FileHistory(str(history_path)))
+
+    pending: "deque[str]" = deque()
+    new_input_evt = asyncio.Event()
+    busy = [False]
+    input_task_holder = [None]  # asyncio.Task
+
+    async def input_loop():
+        """Always running — feeds 'pending' deque. Cancelled briefly during confirm."""
+        try:
+            while True:
+                default = _RECALL_TEXT[0]
+                _RECALL_TEXT[0] = ""
+                try:
+                    line = await session.prompt_async("> ", default=default)
+                except KeyboardInterrupt:
+                    continue
+                except EOFError:
+                    pending.append(None)  # sentinel: exit
+                    new_input_evt.set()
+                    return
+                line = (line or "").strip()
+                if not line:
+                    continue
+                pending.append(line)
+                new_input_evt.set()
+                if busy[0]:
+                    print(f"  [queued #{len(pending)}: {line[:80]}{'...' if len(line) > 80 else ''}]")
+        except asyncio.CancelledError:
+            return
+
+    async def get_input():
+        while not pending:
+            new_input_evt.clear()
+            await new_input_evt.wait()
+        return pending.popleft()
+
+    async def confirm(name, ar):
+        """Pause input_loop, prompt, restart input_loop. Returns 'y' / 'n' / 'a' / 'q'."""
         nonlocal mode
         if name not in _TOOLS_NEEDING_CONFIRM[mode]:
             return "y"
         preview = json.dumps(ar)[:200]
         print(f"\n  [ASK] {name}({preview})")
-        ans = input("  allow? [y]es / [n]o / [a]ll-from-now / [q]uit: ").strip().lower()
+        if input_task_holder[0] is not None:
+            input_task_holder[0].cancel()
+            try:
+                await input_task_holder[0]
+            except asyncio.CancelledError:
+                pass
+        try:
+            ans = (await session.prompt_async(
+                "  allow? [y]es / [n]o / [a]ll-from-now / [q]uit: ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        finally:
+            input_task_holder[0] = asyncio.create_task(input_loop())
         if ans == "a":
-            mode = "yolo"
-            return "y"
+            mode = "yolo"; return "y"
         if ans == "q":
             raise SystemExit(0)
         return "y" if ans == "y" else "n"
 
     messages = chat["messages"]
-    while True:
-        # auto-flush any queued messages first (they came in while agent was busy)
-        queued = _drain_queue_one()
-        if queued is not None:
-            print(f"> {queued}   [auto-sent from queue]")
-            user = queued
-        else:
-            try:
-                user = input("> ").strip()
-            except EOFError:
-                print(); return
-            except KeyboardInterrupt:
-                # at the prompt, single Ctrl-C clears the line; double-tap is handled by handler
-                print(); continue
-        if not user:
-            continue
+    input_task_holder[0] = asyncio.create_task(input_loop())
 
-        if user.startswith("/"):
-            cmd, _, rest = user[1:].partition(" ")
-            if cmd in ("exit", "quit"):
-                return
-            if cmd == "help":
-                print("  /name <name>   rename current chat\n"
-                      "  /list          list chats\n"
-                      "  /id            show this chat's id\n"
-                      "  /mode <m>      change permission mode (safe|auto-edit|yolo)\n"
-                      "  /jobs          list background jobs\n"
-                      "  /kill <id>     kill a background job\n"
-                      "  /log [id]      show full log (fg if no id, else bg job id)\n"
-                      "  /logs          list all saved logs\n"
-                      "  /queue         show queued messages (typed while agent was busy)\n"
-                      "  /recall        pull the most recent queued msg into the prompt to edit\n"
-                      "  /exit          quit\n"
-                      "controls: Ctrl-C interrupts agent; arrow-up at the prompt = history;\n"
-                      "          typing while agent is busy queues; queue auto-sends after.")
-                continue
-            if cmd == "jobs":
-                print(tool_list_bg_jobs())
-                continue
-            if cmd == "kill":
-                jid = rest.strip()
-                if not jid:
-                    print("usage: /kill <job_id>")
-                else:
-                    print(tool_kill_bash(jid))
-                continue
-            if cmd == "queue":
-                with _QUEUE_LOCK:
-                    if not _QUEUE:
-                        print("(no queued messages)")
-                    else:
-                        for i, q in enumerate(_QUEUE, 1):
-                            print(f"  {i}. {q}")
-                continue
-            if cmd == "recall":
-                with _QUEUE_LOCK:
-                    if not _QUEUE:
-                        print("(nothing to recall)")
+    try:
+        with patch_stdout(raw=True):
+            while True:
+                user = await get_input()
+                if user is None:  # EOF sentinel
+                    return
+
+                if user.startswith("/"):
+                    cmd, _, rest = user[1:].partition(" ")
+                    if cmd in ("exit", "quit"):
+                        return
+                    if cmd == "help":
+                        print("  /name <name>   rename current chat\n"
+                              "  /list          list chats\n"
+                              "  /id            show this chat's id\n"
+                              "  /mode <m>      change permission mode (safe|auto-edit|yolo)\n"
+                              "  /jobs          list background jobs\n"
+                              "  /kill <id>     kill a background job\n"
+                              "  /log [id]      show full log (fg if no id, else bg job id)\n"
+                              "  /logs          list all saved logs\n"
+                              "  /queue         show queued messages\n"
+                              "  /recall        pop newest queued message into prompt for editing\n"
+                              "  /exit          quit\n"
+                              "controls: Ctrl-C interrupts agent / clears prompt; double-tap exits.\n"
+                              "          arrow-up at prompt = history; typing while agent is busy\n"
+                              "          queues the line — auto-flushed when the turn ends.")
                         continue
-                    text = _QUEUE.pop()
-                _RECALL_TEXT[0] = text
-                print(f"recalled — edit and press Enter (or Ctrl-C to cancel):")
-                continue
-            if cmd == "log":
-                arg = rest.strip()
-                if not arg:
-                    p = _LAST_FG_LOG[0]
-                    if not p or not p.exists():
-                        print("(no foreground log yet)")
+                    if cmd == "jobs":      print(tool_list_bg_jobs()); continue
+                    if cmd == "kill":
+                        jid = rest.strip()
+                        print(tool_kill_bash(jid) if jid else "usage: /kill <job_id>"); continue
+                    if cmd == "queue":
+                        if not pending:
+                            print("(no queued messages)")
+                        else:
+                            for i, q in enumerate(pending, 1):
+                                print(f"  {i}. {q}")
                         continue
-                    print(f"--- {p} ---")
-                    print(p.read_text(errors="replace"))
-                else:
-                    # accept short bg id, fg-prefix, or full path
-                    candidates = [
-                        _BG_JOBS_DIR / f"{arg}.log",
-                        _BG_JOBS_DIR / arg,
-                        Path(arg),
-                    ]
-                    matches = list(_BG_JOBS_DIR.glob(f"{arg}*.log")) if _BG_JOBS_DIR.exists() else []
-                    p = next((c for c in candidates if c.exists()), None)
-                    if not p and matches:
-                        p = matches[0]
-                    if not p:
-                        print(f"no log found for '{arg}' "
-                              f"(checked {_BG_JOBS_DIR}/<id>.log and prefix matches)")
-                    else:
-                        print(f"--- {p} ---")
-                        print(p.read_text(errors="replace"))
-                continue
-            if cmd == "logs":
-                # list all logs in the jobs dir
-                if not _BG_JOBS_DIR.exists():
-                    print("(no logs)")
-                    continue
-                entries = sorted(_BG_JOBS_DIR.glob("*.log"),
-                                 key=lambda p: p.stat().st_mtime, reverse=True)
-                if not entries:
-                    print("(no logs)")
-                    continue
-                for p in entries[:30]:
-                    sz = p.stat().st_size
-                    age = int(time.time() - p.stat().st_mtime)
-                    print(f"  {p.name:<30}  {sz:>8}b  {age}s ago")
-                if len(entries) > 30:
-                    print(f"  ... ({len(entries) - 30} more)")
-                continue
-            if cmd == "name":
-                chat["name"] = rest.strip() or chat["name"]
-                _save_chat(chat); print(f"named: {chat['name']}"); continue
-            if cmd == "list":
-                for c in _list_chats():
-                    print(f"  {c['id']}  ({c['turns']}t)  {c['name']}")
-                continue
-            if cmd == "id":
-                print(f"  {chat['id']}"); continue
-            if cmd == "mode":
-                m = rest.strip()
-                if m in _TOOLS_NEEDING_CONFIRM:
-                    mode = m; print(f"mode: {mode}")
-                else:
-                    print(f"current mode: {mode} (options: safe, auto-edit, yolo)")
-                continue
-            print("(unknown command — try /help)"); continue
-
-        if not chat["name"]:
-            chat["name"] = user[:60]
-        chat["turn_count"] = chat.get("turn_count", 0) + 1
-        messages.append({"role": "user", "content": user})
-
-        # build the messages we actually send — periodic tool-use reminder injected
-        # near the latest user message but NOT persisted to chat['messages']
-        send_messages = messages
-        if args.reminder_every > 0 and chat["turn_count"] % args.reminder_every == 0:
-            if isinstance(backend, LibreChatBackend):
-                # LibreChat backend only forwards the latest user message's text
-                send_messages = list(messages)
-                last = dict(send_messages[-1])
-                last["content"] = f"[{TOOL_REMINDER}]\n\n{last['content']}"
-                send_messages[-1] = last
-            else:
-                # OpenAI mode: send the full list with an extra system msg before the last user
-                send_messages = list(messages)
-                send_messages.insert(-1, {"role": "system", "content": TOOL_REMINDER})
-
-        _AGENT_BUSY.set()
-        try:
-            for _ in range(20):
-                # stream the assistant turn
-                assistant_text = ""
-                print()
-                for delta in backend.send_stream(send_messages):
-                    print(delta, end="", flush=True)
-                    assistant_text += delta
-                print()
-                messages.append({"role": "assistant", "content": assistant_text})
-                if isinstance(backend, LibreChatBackend):
-                    chat["conversation_id"] = backend.conversation_id
-                    chat["parent_message_id"] = backend.parent_message_id
-
-                calls = extract_tool_calls(assistant_text)
-                if not calls:
-                    print()
-                    break
-                results = []
-                for name, ar in calls:
-                    preview = {k: (v[:80] + "...") if isinstance(v, str) and len(v) > 80 else v
-                               for k, v in (ar.items() if isinstance(ar, dict) else [])}
-                    if name == "__PARSE_ERROR__":
-                        results.append(f"<tool_response>parse error: {ar.get('error')}</tool_response>")
+                    if cmd == "recall":
+                        if not pending:
+                            print("(nothing to recall)")
+                        else:
+                            _RECALL_TEXT[0] = pending.pop()
+                            print("recalled — it'll appear in the next prompt to edit")
                         continue
-                    if name in ("write_file", "edit_file"):
-                        _show_diff_for(name, ar)
-                    decision = confirm(name, ar)
-                    if decision != "y":
-                        print(f"  [skip] {name}")
-                        results.append(f"<tool_response>user declined to run {name}</tool_response>")
+                    if cmd == "log":
+                        arg = rest.strip()
+                        if not arg:
+                            p = _LAST_FG_LOG[0]
+                            if not p or not p.exists():
+                                print("(no foreground log yet)"); continue
+                            print(f"--- {p} ---\n{p.read_text(errors='replace')}")
+                        else:
+                            candidates = [_BG_JOBS_DIR / f"{arg}.log", _BG_JOBS_DIR / arg, Path(arg)]
+                            matches = list(_BG_JOBS_DIR.glob(f"{arg}*.log")) if _BG_JOBS_DIR.exists() else []
+                            p = next((c for c in candidates if c.exists()), None) or (matches[0] if matches else None)
+                            if not p:
+                                print(f"no log found for '{arg}'")
+                            else:
+                                print(f"--- {p} ---\n{p.read_text(errors='replace')}")
                         continue
-                    print(f"  [tool] {name}({preview})")
-                    result = call_tool(name, ar)
-                    results.append(f"<tool_response>\n{result}\n</tool_response>")
-                messages.append({"role": "user", "content": "\n".join(results)})
-                # subsequent inner iterations send the un-augmented history
+                    if cmd == "logs":
+                        if not _BG_JOBS_DIR.exists():
+                            print("(no logs)"); continue
+                        entries = sorted(_BG_JOBS_DIR.glob("*.log"),
+                                         key=lambda p: p.stat().st_mtime, reverse=True)
+                        if not entries:
+                            print("(no logs)"); continue
+                        for p in entries[:30]:
+                            print(f"  {p.name:<30}  {p.stat().st_size:>8}b  "
+                                  f"{int(time.time() - p.stat().st_mtime)}s ago")
+                        if len(entries) > 30:
+                            print(f"  ... ({len(entries) - 30} more)")
+                        continue
+                    if cmd == "name":
+                        chat["name"] = rest.strip() or chat["name"]
+                        _save_chat(chat); print(f"named: {chat['name']}"); continue
+                    if cmd == "list":
+                        for c in _list_chats():
+                            print(f"  {c['id']}  ({c['turns']}t)  {c['name']}")
+                        continue
+                    if cmd == "id":
+                        print(f"  {chat['id']}"); continue
+                    if cmd == "mode":
+                        m = rest.strip()
+                        if m in _TOOLS_NEEDING_CONFIRM:
+                            mode = m; print(f"mode: {mode}")
+                        else:
+                            print(f"current mode: {mode} (options: safe, auto-edit, yolo)")
+                        continue
+                    print("(unknown command — try /help)"); continue
+
+                if not chat["name"]:
+                    chat["name"] = user[:60]
+                chat["turn_count"] = chat.get("turn_count", 0) + 1
+                messages.append({"role": "user", "content": user})
+
                 send_messages = messages
-            else:
-                print("(stopped: tool-call chain exceeded 20 iterations)")
-        except KeyboardInterrupt:
-            print("\n(interrupted — back to prompt; press Ctrl-C again quickly to exit)")
-            # rewind any half-saved assistant turn so the chat doesn't get a dangling reply
-            while messages and messages[-1]["role"] != "user":
-                messages.pop()
-            # also drop the user msg we appended this turn so retry feels clean
-            if messages and messages[-1]["role"] == "user":
-                messages.pop()
-        finally:
-            _AGENT_BUSY.clear()
-            with _QUEUE_LOCK:
-                pending = len(_QUEUE)
-            if pending:
-                print(f"  [{pending} queued message{'s' if pending > 1 else ''} will auto-send]")
+                if args.reminder_every > 0 and chat["turn_count"] % args.reminder_every == 0:
+                    if isinstance(backend, LibreChatBackend):
+                        send_messages = list(messages)
+                        last = dict(send_messages[-1])
+                        last["content"] = f"[{TOOL_REMINDER}]\n\n{last['content']}"
+                        send_messages[-1] = last
+                    else:
+                        send_messages = list(messages)
+                        send_messages.insert(-1, {"role": "system", "content": TOOL_REMINDER})
 
-        _save_chat(chat)
+                busy[0] = True
+                try:
+                    for _ in range(20):
+                        assistant_text = ""
+                        print()
+                        async for delta in _stream_to_async(backend.send_stream(send_messages)):
+                            sys.stdout.write(delta); sys.stdout.flush()
+                            assistant_text += delta
+                        print()
+                        messages.append({"role": "assistant", "content": assistant_text})
+                        if isinstance(backend, LibreChatBackend):
+                            chat["conversation_id"] = backend.conversation_id
+                            chat["parent_message_id"] = backend.parent_message_id
+
+                        calls = extract_tool_calls(assistant_text)
+                        if not calls:
+                            print()
+                            break
+                        results = []
+                        for name, ar in calls:
+                            preview = {k: (v[:80] + "...") if isinstance(v, str) and len(v) > 80 else v
+                                       for k, v in (ar.items() if isinstance(ar, dict) else [])}
+                            if name == "__PARSE_ERROR__":
+                                results.append(f"<tool_response>parse error: {ar.get('error')}</tool_response>")
+                                continue
+                            if name in ("write_file", "edit_file"):
+                                _show_diff_for(name, ar)
+                            decision = await confirm(name, ar)
+                            if decision != "y":
+                                print(f"  [skip] {name}")
+                                results.append(f"<tool_response>user declined to run {name}</tool_response>")
+                                continue
+                            print(f"  [tool] {name}({preview})")
+                            # tool runs in a thread so we don't block the event loop
+                            # (and so KeyboardInterrupt during run_bash works)
+                            result = await asyncio.to_thread(call_tool, name, ar)
+                            results.append(f"<tool_response>\n{result}\n</tool_response>")
+                        messages.append({"role": "user", "content": "\n".join(results)})
+                        send_messages = messages
+                    else:
+                        print("(stopped: tool-call chain exceeded 20 iterations)")
+                except KeyboardInterrupt:
+                    print("\n(interrupted — back to prompt; press Ctrl-C again quickly to exit)")
+                    while messages and messages[-1]["role"] != "user":
+                        messages.pop()
+                    if messages and messages[-1]["role"] == "user":
+                        messages.pop()
+                finally:
+                    busy[0] = False
+                    if pending:
+                        print(f"  [{len(pending)} queued message{'s' if len(pending) > 1 else ''} will auto-send]")
+
+                _save_chat(chat)
+    finally:
+        if input_task_holder[0] is not None:
+            input_task_holder[0].cancel()
+
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

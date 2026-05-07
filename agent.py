@@ -909,7 +909,19 @@ def main():
                       "  /list          list chats\n"
                       "  /id            show this chat's id\n"
                       "  /mode <m>      change permission mode (safe|auto-edit|yolo)\n"
+                      "  /jobs          list background jobs\n"
+                      "  /kill <id>     kill a background job\n"
                       "  /exit          quit")
+                continue
+            if cmd == "jobs":
+                print(tool_list_bg_jobs())
+                continue
+            if cmd == "kill":
+                jid = rest.strip()
+                if not jid:
+                    print("usage: /kill <job_id>")
+                else:
+                    print(tool_kill_bash(jid))
                 continue
             if cmd == "name":
                 chat["name"] = rest.strip() or chat["name"]

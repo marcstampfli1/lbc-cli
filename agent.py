@@ -1040,20 +1040,24 @@ async def main_async():
 
     @kb.add("c-c")
     def _(event):
+        now = time.monotonic()
+        is_double = (now - _last_sigint[0]) < 1.5
+        _last_sigint[0] = now
+        if is_double:
+            # double-tap: exit regardless of what state we were in
+            event.app.exit(exception=KeyboardInterrupt)
+            return
+        # single tap — priority: kill fg, else clear buffer, else hint
         proc = _CURRENT_FG.get("proc")
         if proc is not None:
             try: proc.terminate()
             except Exception: pass
-            _msg(event, "\n[Ctrl+C] terminated foreground command")
+            _msg(event, "\n[Ctrl+C] terminated foreground command  (press again to exit)")
             return
-        # default-ish behavior: clear the input line, or exit on double-tap
-        now = time.monotonic()
         if event.current_buffer.text:
             event.current_buffer.reset()
             return
-        if now - _last_sigint[0] < 1.5:
-            event.app.exit(exception=KeyboardInterrupt)
-        _last_sigint[0] = now
+        _msg(event, "\n(Ctrl+C — press again quickly to exit)")
 
     @kb.add("c-j")
     def _(event):

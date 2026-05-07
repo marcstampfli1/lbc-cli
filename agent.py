@@ -31,6 +31,63 @@ def _try_json(r):
     except (json.JSONDecodeError, ValueError):
         return None
 
+
+def _validate_url(url, name="URL"):
+    """Return (parsed, error_msg). error_msg is empty string on success."""
+    if not url:
+        return None, f"{name} is empty"
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except (ValueError, AttributeError) as e:
+        return None, f"{name} is malformed: {e}"
+    if p.scheme not in ("http", "https"):
+        return None, f"{name} must start with http:// or https:// (got {p.scheme or 'no scheme'})"
+    if not p.hostname:
+        return None, f"{name} has no hostname"
+    return p, ""
+
+
+def _validate_session(state):
+    """Return error_msg ('' if session is usable)."""
+    if not isinstance(state, dict):
+        return "session file is not a JSON object"
+    if not isinstance(state.get("token"), str) or not state["token"]:
+        return "session has no JWT — run a login command"
+    cookies = state.get("cookies")
+    if not isinstance(cookies, list):
+        return "session has no cookies array"
+    rt = next((c for c in cookies if isinstance(c, dict) and c.get("name") == "refreshToken"), None)
+    if not rt or not isinstance(rt.get("value"), str) or not rt["value"]:
+        return "session has no refreshToken cookie — run a login command"
+    return ""
+
+
+# transient HTTP failures we retry (with bounded backoff)
+_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+_RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
+                     httpx.PoolTimeout, httpx.RemoteProtocolError)
+
+
+def _request_with_retry(send_fn, *, attempts=3, base_delay=0.5):
+    """Run send_fn() (returning httpx.Response) with bounded backoff on
+    transient errors. Caller owns interpretation of non-retried responses."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            r = send_fn()
+        except _RETRY_EXCEPTIONS as e:
+            last_exc = e
+            if i == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** i))
+            continue
+        if r.status_code in _RETRY_STATUSES and i < attempts - 1:
+            time.sleep(base_delay * (2 ** i))
+            continue
+        return r
+    raise last_exc if last_exc else RuntimeError("retry exhausted without response")
+
 CONFIG_DIR = Path(os.environ.get("CLI_AGENT_CONFIG_DIR") or
                   Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cli-agent")
 _env_file = CONFIG_DIR / ".env"
@@ -135,11 +192,36 @@ DISPATCH = {
     "run_bash": tool_run_bash,
 }
 
+# required argument schema per tool: name -> {arg_name: type}
+_TOOL_SCHEMAS = {
+    "read_file":  {"path": str},
+    "write_file": {"path": str, "content": str},
+    "edit_file":  {"path": str, "old_string": str, "new_string": str},
+    "list_dir":   {"path": str},
+    "run_bash":   {"command": str},
+}
+
+def _validate_tool_args(name, args):
+    if name not in DISPATCH:
+        return f"unknown tool '{name}' (available: {', '.join(DISPATCH)})"
+    if not isinstance(args, dict):
+        return f"args must be a JSON object, got {type(args).__name__}"
+    schema = _TOOL_SCHEMAS[name]
+    for k, t in schema.items():
+        if k not in args:
+            return f"missing required arg '{k}' for {name}"
+        if not isinstance(args[k], t):
+            return f"arg '{k}' for {name} must be {t.__name__}, got {type(args[k]).__name__}"
+        if t is str and not args[k]:
+            return f"arg '{k}' for {name} must be non-empty"
+    return None
+
 def call_tool(name, args):
+    err = _validate_tool_args(name, args)
+    if err:
+        return f"ERROR: {err}"
     try:
         return DISPATCH[name](**args)
-    except KeyError:
-        return f"ERROR: unknown tool '{name}'"
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
@@ -248,16 +330,32 @@ class LibreChatBackend:
     across versions."""
 
     def __init__(self):
-        if not all([LIBRECHAT_URL, LIBRECHAT_MODEL, LIBRECHAT_ENDPOINT]):
-            raise RuntimeError("LIBRECHAT_URL, LIBRECHAT_MODEL, LIBRECHAT_ENDPOINT must all be set in .env")
-        if not Path(SESSION_FILE).exists():
-            raise RuntimeError(f"{SESSION_FILE} missing — run login.py first")
+        # validate config before doing anything else
+        _, err = _validate_url(LIBRECHAT_URL, "LIBRECHAT_URL")
+        if err:
+            raise RuntimeError(f"config error: {err}. Run: cli-agent config")
+        for name, val in [("LIBRECHAT_MODEL", LIBRECHAT_MODEL), ("LIBRECHAT_ENDPOINT", LIBRECHAT_ENDPOINT)]:
+            if not val:
+                raise RuntimeError(f"config error: {name} not set. Run: cli-agent config")
 
-        state = json.loads(Path(SESSION_FILE).read_text())
+        # load + validate session
+        if not Path(SESSION_FILE).exists():
+            raise RuntimeError(f"no session at {SESSION_FILE} — run a login command first")
+        try:
+            state = json.loads(Path(SESSION_FILE).read_text())
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"session file {SESSION_FILE} is not valid JSON: {e}. "
+                               "Re-run a login command.")
+        err = _validate_session(state)
+        if err:
+            raise RuntimeError(f"{err}")
         # plain dict — httpx.Cookies jar's domain matching was silently dropping our
         # cookies. We only need the refreshToken cookie on /api/auth/refresh, so we
         # pass it explicitly there rather than relying on a jar.
-        self._cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
+        self._cookies = {c["name"]: c["value"]
+                         for c in state.get("cookies", [])
+                         if isinstance(c, dict) and isinstance(c.get("name"), str)
+                         and isinstance(c.get("value"), str)}
         token = state.get("token") or _find_token_in_storage(state)
         if not token:
             raise RuntimeError("no JWT in session.json — re-run login")
@@ -280,7 +378,8 @@ class LibreChatBackend:
         # /api/auth/refresh exchanges the refreshToken cookie for a new access token
         if "refreshToken" not in self._cookies:
             raise RuntimeError("no refreshToken in session — re-run a login command")
-        r = self.client.post("/api/auth/refresh", cookies=self._cookies)
+        r = _request_with_retry(
+            lambda: self.client.post("/api/auth/refresh", cookies=self._cookies))
         if r.status_code != 200:
             raise RuntimeError(
                 f"refresh failed: HTTP {r.status_code} — {r.text[:200]}. "
@@ -347,10 +446,10 @@ class LibreChatBackend:
             payload["conversationId"] = self.conversation_id
 
         url = f"/api/agents/chat/{LIBRECHAT_ENDPOINT}"
-        r = self.client.post(url, json=payload)
+        r = _request_with_retry(lambda: self.client.post(url, json=payload))
         if r.status_code == 401:
             self._refresh_token()
-            r = self.client.post(url, json=payload)
+            r = _request_with_retry(lambda: self.client.post(url, json=payload))
         if r.status_code != 200:
             raise RuntimeError(
                 f"chat POST {url} failed: HTTP {r.status_code} — {r.text[:300]}")

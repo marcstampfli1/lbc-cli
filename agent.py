@@ -1249,6 +1249,7 @@ async def main_async():
                               "  /logs          list all saved logs\n"
                               "  /queue         show queued messages\n"
                               "  /recall        pop newest queued message into prompt for editing\n"
+                              "  /thinking      show last captured reasoning trace (also Ctrl+T)\n"
                               "  /exit          quit\n"
                               "keys:\n"
                               "  Ctrl+C   kill running fg command, or clear prompt, or (double-tap) exit\n"
@@ -1275,6 +1276,13 @@ async def main_async():
                         else:
                             _RECALL_TEXT[0] = pending.pop()
                             print("recalled — it'll appear in the next prompt to edit")
+                        continue
+                    if cmd in ("thinking", "think"):
+                        rt = chat.get("last_reasoning", "")
+                        if not rt:
+                            print("(no reasoning captured for the last turn — model may not emit it)")
+                        else:
+                            print(f"--- thinking ({len(rt)} chars) ---\n{rt}\n--- end thinking ---")
                         continue
                     if cmd == "log":
                         arg = rest.strip()

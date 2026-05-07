@@ -129,8 +129,12 @@ SYSTEM_PROMPT = (
        background=true returns immediately with a job_id — use it for servers,
        watchers, builds, or anything that won't finish in seconds. Default
        (background=false) blocks for up to 60s.
-  - monitor_bash(job_id: str, tail_lines?: int)      # check a background job
-  - kill_bash(job_id: str)                           # stop a background job
+  - monitor_bash(job_id: str, tail_lines?: int)      # check one bg job
+  - list_bg_jobs()                                   # list all bg jobs in this session
+  - kill_bash(job_id: str)                           # stop a bg job
+
+You can interrupt a foreground run_bash by pressing Ctrl-C in the terminal —
+it will be killed and you'll be told what partial output was captured.
 
 To call a tool, emit a block in EXACTLY this shape (nothing before or after):
 
@@ -195,11 +199,32 @@ def _tail_file(path, n):
 
 def tool_run_bash(command, background=False):
     if not background:
+        # Popen so we can clean up on Ctrl-C or timeout instead of leaving zombies
+        proc = subprocess.Popen(
+            command, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
         try:
-            r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+            stdout, stderr = proc.communicate(timeout=60)
+        except KeyboardInterrupt:
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            raise  # let the agent loop catch it like any other interrupt
         except subprocess.TimeoutExpired:
-            return "ERROR: foreground command timed out after 60s — use background=true for long-running jobs"
-        return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}--- stderr ---\n{r.stderr}"
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            return (f"ERROR: foreground command timed out after 60s and was killed. "
+                    f"Use background=true for long-running jobs.\n"
+                    f"--- partial stdout ---\n{stdout}--- partial stderr ---\n{stderr}")
+        return f"exit={proc.returncode}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
 
     # background mode
     import time as _time
@@ -242,6 +267,20 @@ def tool_monitor_bash(job_id, tail_lines=50):
             f"{_tail_file(log_path, tail_lines)}")
 
 
+def tool_list_bg_jobs():
+    if not _BG_JOBS:
+        return "no background jobs"
+    import time as _time
+    lines = []
+    for jid, job in _BG_JOBS.items():
+        rc = job["proc"].poll()
+        status = "running" if rc is None else f"exited (rc={rc})"
+        elapsed = int(_time.time() - job["started"])
+        cmd = job["command"]
+        lines.append(f"  {jid}  {status:<18}  {elapsed:>4}s  {cmd[:80]}")
+    return "background jobs:\n" + "\n".join(lines)
+
+
 def tool_kill_bash(job_id):
     job = _BG_JOBS.get(job_id)
     if not job:
@@ -265,6 +304,7 @@ DISPATCH = {
     "list_dir": tool_list_dir,
     "run_bash": tool_run_bash,
     "monitor_bash": tool_monitor_bash,
+    "list_bg_jobs": tool_list_bg_jobs,
     "kill_bash": tool_kill_bash,
 }
 
@@ -276,6 +316,7 @@ _TOOL_SCHEMAS = {
     "list_dir":     {"req": {"path": str},                                                      "opt": {}},
     "run_bash":     {"req": {"command": str},                                                   "opt": {"background": bool}},
     "monitor_bash": {"req": {"job_id": str},                                                    "opt": {"tail_lines": int}},
+    "list_bg_jobs": {"req": {},                                                                 "opt": {}},
     "kill_bash":    {"req": {"job_id": str},                                                    "opt": {}},
 }
 
@@ -599,17 +640,30 @@ class LibreChatBackend:
                 if obj.get("final"):
                     final_event = obj
                     break
-                # interim chunks: 'text' may be cumulative or a delta
+                # current LibreChat: {"event": "on_message_delta", "data": {"delta": {"content": [{"type":"text","text":"..."}]}}}
+                if obj.get("event") == "on_message_delta":
+                    data = obj.get("data") or {}
+                    delta = data.get("delta") or {}
+                    content = delta.get("content") or []
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                chunk = part.get("text") or ""
+                                if chunk:
+                                    seen_text += chunk
+                                    yield chunk
+                    continue
+                # legacy: top-level 'text' field (older LibreChat versions / some endpoints)
                 t = obj.get("text")
                 if isinstance(t, str) and t:
                     if t.startswith(seen_text):
-                        delta = t[len(seen_text):]
+                        d = t[len(seen_text):]
                         seen_text = t
                     else:
-                        delta = t
+                        d = t
                         seen_text += t
-                    if delta:
-                        yield delta
+                    if d:
+                        yield d
 
         if final_event:
             resp = final_event.get("responseMessage") or {}

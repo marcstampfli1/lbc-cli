@@ -202,7 +202,12 @@ def extract_tool_calls(text):
 class OpenAIBackend:
     def __init__(self):
         from openai import OpenAI
-        self.client = OpenAI(base_url=OPENAI_BASE_URL or None, api_key=OPENAI_API_KEY)
+        # disable cert verification on the underlying httpx client used by the SDK
+        self.client = OpenAI(
+            base_url=OPENAI_BASE_URL or None,
+            api_key=OPENAI_API_KEY,
+            http_client=httpx.Client(verify=False, timeout=httpx.Timeout(180.0, connect=10.0)),
+        )
         self.model = AGENT_MODEL
 
     def send_stream(self, messages):

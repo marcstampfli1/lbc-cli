@@ -30,11 +30,15 @@ password = os.environ.get("LIBRECHAT_PASSWORD") or getpass.getpass("password: ")
 from urllib.parse import urlparse
 host = urlparse(URL).hostname or "localhost"
 
-with httpx.Client(base_url=URL, timeout=30.0) as c:
+with httpx.Client(base_url=URL, timeout=30.0, verify=False) as c:
     r = c.post("/api/auth/login", json={"email": email, "password": password})
-    r.raise_for_status()
-    body = r.json()
-    token = body["token"]
+    if r.status_code != 200:
+        sys.exit(f"login failed: HTTP {r.status_code} — {r.text[:300]}")
+    try:
+        body = r.json()
+        token = body["token"]
+    except (json.JSONDecodeError, ValueError, KeyError):
+        sys.exit(f"login returned unexpected body: {r.text[:300]}")
     cookies = [
         {"name": k, "value": v, "domain": host, "path": "/"}
         for k, v in c.cookies.items()
@@ -46,10 +50,15 @@ print(f"saved session to {SESSION_FILE}")
 
 # probe endpoints/models and suggest .env values
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-with httpx.Client(base_url=URL, timeout=30.0,
+with httpx.Client(base_url=URL, timeout=30.0, verify=False,
                   headers={"Authorization": f"Bearer {token}", "User-Agent": UA}) as c:
-    endpoints = c.get("/api/endpoints").json()
-    models = c.get("/api/models").json()
+    ep_r = c.get("/api/endpoints")
+    md_r = c.get("/api/models")
+    try:
+        endpoints = ep_r.json() if ep_r.status_code == 200 else {}
+        models = md_r.json() if md_r.status_code == 200 else {}
+    except (json.JSONDecodeError, ValueError):
+        endpoints, models = {}, {}
 
 print("\n--- /api/endpoints ---")
 print(json.dumps(endpoints, indent=2)[:2000])

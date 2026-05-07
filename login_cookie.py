@@ -35,14 +35,17 @@ refresh_token = getpass.getpass("refreshToken: ").strip()
 if not refresh_token:
     sys.exit("no token entered")
 
-with httpx.Client(base_url=URL, timeout=30.0,
+with httpx.Client(base_url=URL, timeout=30.0, verify=False,
                   headers={"User-Agent": UA},
                   cookies={"refreshToken": refresh_token}) as c:
     r = c.post("/api/auth/refresh")
-    if not r.ok:
-        sys.exit(f"refresh failed (HTTP {r.status_code}): {r.text[:300]}")
-    body = r.json()
-    token = body["token"]
+    if r.status_code != 200:
+        sys.exit(f"refresh failed: HTTP {r.status_code} — {r.text[:300]}")
+    try:
+        body = r.json()
+        token = body["token"]
+    except (json.JSONDecodeError, ValueError, KeyError):
+        sys.exit(f"refresh returned unexpected body: {r.text[:300]}")
 
 from urllib.parse import urlparse
 host = urlparse(URL).hostname or "localhost"
@@ -55,7 +58,7 @@ Path(SESSION_FILE).parent.mkdir(parents=True, exist_ok=True)
 Path(SESSION_FILE).write_text(json.dumps(state, indent=2))
 print(f"\nsaved session to {SESSION_FILE}")
 
-with httpx.Client(base_url=URL, timeout=30.0,
+with httpx.Client(base_url=URL, timeout=30.0, verify=False,
                   headers={"Authorization": f"Bearer {token}", "User-Agent": UA}) as c:
     print("\n--- /api/endpoints ---")
     print(c.get("/api/endpoints").text[:1500])

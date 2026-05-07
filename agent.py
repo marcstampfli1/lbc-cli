@@ -23,6 +23,14 @@ for s in (sys.stdin, sys.stdout):
     except Exception:
         pass
 
+
+def _try_json(r):
+    """Decode response as JSON, return None on failure (never raises)."""
+    try:
+        return r.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+
 CONFIG_DIR = Path(os.environ.get("CLI_AGENT_CONFIG_DIR") or
                   Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cli-agent")
 _env_file = CONFIG_DIR / ".env"
@@ -241,19 +249,17 @@ class LibreChatBackend:
             raise RuntimeError(f"{SESSION_FILE} missing — run login.py first")
 
         state = json.loads(Path(SESSION_FILE).read_text())
-        jar = httpx.Cookies()
-        from urllib.parse import urlparse
-        default_host = urlparse(LIBRECHAT_URL).hostname or "localhost"
-        for c in state.get("cookies", []):
-            domain = (c.get("domain") or "").lstrip(".") or default_host
-            jar.set(c["name"], c["value"], domain=domain, path=c.get("path") or "/")
+        # plain dict — httpx.Cookies jar's domain matching was silently dropping our
+        # cookies. We only need the refreshToken cookie on /api/auth/refresh, so we
+        # pass it explicitly there rather than relying on a jar.
+        self._cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
         token = state.get("token") or _find_token_in_storage(state)
         if not token:
             raise RuntimeError("no JWT in session.json — re-run login")
         self.client = httpx.Client(
             base_url=LIBRECHAT_URL,
-            cookies=jar,
             timeout=httpx.Timeout(180.0, connect=10.0),
+            verify=False,  # caller asserts trust — chatouille often uses internal certs
             headers={
                 # LibreChat's uaParser middleware rejects non-browser User-Agents
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -267,19 +273,40 @@ class LibreChatBackend:
 
     def _refresh_token(self):
         # /api/auth/refresh exchanges the refreshToken cookie for a new access token
-        r = self.client.post("/api/auth/refresh")
-        if not r.is_success:
+        if "refreshToken" not in self._cookies:
+            raise RuntimeError("no refreshToken in session — re-run a login command")
+        r = self.client.post("/api/auth/refresh", cookies=self._cookies)
+        if r.status_code != 200:
             raise RuntimeError(
-                f"refresh failed (HTTP {r.status_code}). The refreshToken cookie "
-                f"is probably expired — re-run a login command (cli-agent login).")
-        try:
-            new_token = r.json()["token"]
-        except (json.JSONDecodeError, KeyError) as e:
+                f"refresh failed: HTTP {r.status_code} — {r.text[:200]}. "
+                "The refreshToken is probably expired — re-run a login command.")
+        body = _try_json(r)
+        new_token = (body or {}).get("token")
+        if not new_token:
             raise RuntimeError(
-                f"refresh returned unexpected body: {r.text[:200]} — re-run a login command.") from e
+                f"refresh returned unexpected body (HTTP {r.status_code}): "
+                f"{r.text[:200]} — re-run a login command.")
+        # capture rotated refreshToken if the server issued a new one
+        for sc in r.headers.get_list("set-cookie") if hasattr(r.headers, "get_list") else []:
+            if sc.startswith("refreshToken="):
+                self._cookies["refreshToken"] = sc.split("=", 1)[1].split(";", 1)[0]
+                break
+        # also check via the multi-value Set-Cookie header (httpx exposes per-line)
+        raw = r.headers.get("set-cookie", "")
+        if raw and "refreshToken=" in raw:
+            for part in raw.split(","):
+                part = part.strip()
+                if part.startswith("refreshToken="):
+                    self._cookies["refreshToken"] = part.split("=", 1)[1].split(";", 1)[0]
+                    break
         self.client.headers["Authorization"] = f"Bearer {new_token}"
+        # persist
         state = json.loads(Path(SESSION_FILE).read_text())
         state["token"] = new_token
+        for c in state.get("cookies", []):
+            if c["name"] == "refreshToken":
+                c["value"] = self._cookies["refreshToken"]
+                break
         Path(SESSION_FILE).write_text(json.dumps(state, indent=2))
 
     def send_stream(self, messages):
@@ -319,8 +346,14 @@ class LibreChatBackend:
         if r.status_code == 401:
             self._refresh_token()
             r = self.client.post(url, json=payload)
-        r.raise_for_status()
-        init = r.json()
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"chat POST {url} failed: HTTP {r.status_code} — {r.text[:300]}")
+        init = _try_json(r)
+        if not init or "streamId" not in init:
+            raise RuntimeError(
+                f"chat POST {url} returned unexpected body (HTTP {r.status_code}): "
+                f"{r.text[:300]}")
         stream_id = init["streamId"]
         self.conversation_id = init.get("conversationId", self.conversation_id)
 
@@ -330,7 +363,10 @@ class LibreChatBackend:
             "GET", f"/api/agents/chat/stream/{stream_id}",
             headers={"Accept": "text/event-stream"},
         ) as sr:
-            sr.raise_for_status()
+            if sr.status_code != 200:
+                raise RuntimeError(
+                    f"chat stream failed: HTTP {sr.status_code} — "
+                    f"{sr.read().decode('utf-8', 'replace')[:300]}")
             for raw in sr.iter_lines():
                 if not raw or not raw.startswith("data:"):
                     continue

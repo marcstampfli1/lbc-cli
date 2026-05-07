@@ -30,8 +30,8 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 def main():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        ctx = browser.new_context(user_agent=UA)
+        browser = p.chromium.launch(headless=False, args=["--ignore-certificate-errors"])
+        ctx = browser.new_context(user_agent=UA, ignore_https_errors=True)
         page = ctx.new_page()
         print(f"opening {URL} — log in normally in the browser window.")
         page.goto(URL)

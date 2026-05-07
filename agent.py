@@ -127,24 +127,22 @@ SYSTEM_PROMPT = (
   - list_dir(path: str)
   - run_bash(command: str)
 
-To call a tool, emit ONLY this block (nothing before or after):
+To call a tool, emit a block in EXACTLY this shape (nothing before or after):
 
 <tool_call>
-{"name": "TOOL_NAME", "arguments": {"ARG": "VALUE"}}
-</tool_call>
-
-Then STOP. The user will reply with the result wrapped in <tool_response>...</tool_response>.
-After receiving the result, call another tool or give the final plain-text answer.
-
-Example:
-User: what's in /etc/hostname?
-Assistant: <tool_call>
 {"name": "read_file", "arguments": {"path": "/etc/hostname"}}
 </tool_call>
-User: <tool_response>
-parrot
-</tool_response>
-Assistant: The hostname is "parrot".
+
+Replace "read_file" with the actual tool you need and the arguments with real
+values. The whole inside MUST be a single valid JSON object with exactly two
+keys: "name" (string) and "arguments" (object). Then STOP — the user will
+reply with the result wrapped in <tool_response>...</tool_response>.
+
+DO NOT use any other format. DO NOT write `TOOL_NAME: …` lines or YAML or
+plain text labels — only the <tool_call> block above will be executed.
+DO NOT write bash code blocks for the user to run; emit a tool_call with
+run_bash instead. After the result comes back, call another tool or write
+the final plain-text answer (no tool_call block in that case).
 
 Be concise. Stop and ask before destructive actions (rm -rf, dropping data, force pushes)."""
 
@@ -259,6 +257,33 @@ def _find_balanced_json_objects(text):
                 yield text[start:i+1]
                 start = -1
 
+_KV_NAME_RE = re.compile(
+    r"(?:^|\n)\s*(?:tool[_-]?name|TOOL_NAME|tool|function|name)\s*[:=]\s*[\"']?([a-zA-Z_]\w*)[\"']?",
+    re.IGNORECASE,
+)
+
+def _kv_drift_calls(text, valid_names):
+    """Last-resort parser for models that drift to 'TOOL_NAME: x / arguments: {...}'
+    style instead of emitting <tool_call> JSON. Yields (name, args_dict)."""
+    out = []
+    for m in _KV_NAME_RE.finditer(text):
+        name = m.group(1)
+        if name not in valid_names:
+            continue
+        rest = text[m.end():]
+        for raw in _find_balanced_json_objects(rest):
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            # could be {arguments: {...}} or the args dict directly
+            args = obj.get("arguments") if isinstance(obj.get("arguments"), dict) else obj
+            out.append((name, args))
+            break
+    return out
+
 def extract_tool_calls(text):
     calls = []
     matches = list(TOOL_RE.finditer(text))
@@ -269,7 +294,7 @@ def extract_tool_calls(text):
             except (json.JSONDecodeError, KeyError) as e:
                 calls.append(("__PARSE_ERROR__", {"raw": m.group(1), "error": str(e)}))
         return calls
-    # fallback: any balanced {...} that parses to an object with "name"
+    # fallback 1: bare JSON object with "name" + ("arguments"|"args")
     for raw in _find_balanced_json_objects(text):
         try:
             obj = json.loads(raw)
@@ -277,7 +302,10 @@ def extract_tool_calls(text):
             continue
         if isinstance(obj, dict) and "name" in obj and ("arguments" in obj or "args" in obj):
             calls.append(_parse_call(raw))
-    return calls
+    if calls:
+        return calls
+    # fallback 2: KV drift ("TOOL_NAME: foo\narguments: {...}")
+    return _kv_drift_calls(text, set(DISPATCH))
 
 
 # --- backends ---

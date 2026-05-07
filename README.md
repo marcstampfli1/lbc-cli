@@ -106,13 +106,27 @@ Type a request at the `>` prompt. The agent works in your **current directory** 
 all relative paths in tool calls are relative to wherever you `cd`'d before
 invoking it.
 
+### Tools the agent has
+
+| Tool | Purpose |
+|---|---|
+| `read_file(path)` | read a text file |
+| `list_dir(path)` | list directory entries |
+| `write_file(path, content)` | create or overwrite a file (shows a diff first) |
+| `edit_file(path, old, new, replace_all?)` | targeted find/replace (shows a diff first) |
+| `run_bash(command, background?)` | run a shell command; `background=true` returns a `job_id` |
+| `monitor_bash(job_id, tail_lines?)` | check status + recent output of a bg job |
+| `kill_bash(job_id)` | terminate a bg job |
+
 ### Permission modes
 
-| Mode        | Asks before `run_bash` | Asks before `write_file` |
-|-------------|:----------------------:|:------------------------:|
+| Mode        | Asks before `run_bash`/`kill_bash` | Asks before `write_file`/`edit_file` |
+|-------------|:--:|:--:|
 | `safe` (default) | yes | yes |
 | `auto-edit` | yes | no  |
 | `yolo`      | no  | no  |
+
+`read_file`, `list_dir`, and `monitor_bash` are read-only and never prompt.
 
 When the agent asks, you can answer `y` (allow once), `n` (decline), `a`
 (allow-all-from-now-on — switches the rest of the session to yolo), or

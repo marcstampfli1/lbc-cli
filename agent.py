@@ -125,7 +125,12 @@ SYSTEM_PROMPT = (
        and replaces it with new_string. Use this for small/targeted edits
        instead of rewriting the whole file with write_file.
   - list_dir(path: str)
-  - run_bash(command: str)
+  - run_bash(command: str, background?: bool)
+       background=true returns immediately with a job_id — use it for servers,
+       watchers, builds, or anything that won't finish in seconds. Default
+       (background=false) blocks for up to 60s.
+  - monitor_bash(job_id: str, tail_lines?: int)      # check a background job
+  - kill_bash(job_id: str)                           # stop a background job
 
 To call a tool, emit a block in EXACTLY this shape (nothing before or after):
 
@@ -175,12 +180,83 @@ def tool_list_dir(path):
     entries = sorted(os.listdir(Path(path).expanduser()))
     return "\n".join(entries) if entries else "(empty)"
 
-def tool_run_bash(command):
+_BG_JOBS_DIR = Path("/tmp/cli-agent-jobs")
+_BG_JOBS = {}  # job_id -> {"proc": Popen, "log": Path, "command": str, "started": float}
+
+
+def _tail_file(path, n):
     try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        text = Path(path).read_text(errors="replace")
+    except OSError as e:
+        return f"(error reading log: {e})"
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if lines else "(empty)"
+
+
+def tool_run_bash(command, background=False):
+    if not background:
+        try:
+            r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return "ERROR: foreground command timed out after 60s — use background=true for long-running jobs"
+        return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}--- stderr ---\n{r.stderr}"
+
+    # background mode
+    import time as _time
+    _BG_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex[:8]
+    log_path = _BG_JOBS_DIR / f"{job_id}.log"
+    log_fd = log_path.open("wb")
+    try:
+        proc = subprocess.Popen(
+            command, shell=True,
+            stdout=log_fd, stderr=subprocess.STDOUT,
+            start_new_session=True,  # detach so Ctrl-C in agent doesn't kill it
+        )
+    except OSError as e:
+        log_fd.close()
+        return f"ERROR: failed to start: {e}"
+    _BG_JOBS[job_id] = {"proc": proc, "log": log_path, "command": command,
+                        "started": _time.time(), "log_fd": log_fd}
+    return (f"started background job {job_id} (pid {proc.pid})\n"
+            f"log: {log_path}\n"
+            f"call monitor_bash(job_id='{job_id}') to check status, "
+            f"kill_bash(job_id='{job_id}') to stop it.")
+
+
+def tool_monitor_bash(job_id, tail_lines=50):
+    log_path = _BG_JOBS_DIR / f"{job_id}.log"
+    job = _BG_JOBS.get(job_id)
+    if not job:
+        if log_path.exists():
+            return (f"job {job_id} not tracked in this session (agent restarted?) — "
+                    f"showing log file:\n{_tail_file(log_path, tail_lines)}")
+        return f"ERROR: no such job '{job_id}'"
+    rc = job["proc"].poll()
+    import time as _time
+    elapsed = int(_time.time() - job["started"])
+    status = "running" if rc is None else f"exited (rc={rc})"
+    return (f"job {job_id}: {status} ({elapsed}s elapsed)\n"
+            f"command: {job['command']}\n"
+            f"--- last {tail_lines} log lines ---\n"
+            f"{_tail_file(log_path, tail_lines)}")
+
+
+def tool_kill_bash(job_id):
+    job = _BG_JOBS.get(job_id)
+    if not job:
+        return f"ERROR: no such job '{job_id}'"
+    proc = job["proc"]
+    if proc.poll() is not None:
+        return f"job {job_id} already exited (rc={proc.returncode})"
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 60s"
-    return f"exit={r.returncode}\n--- stdout ---\n{r.stdout}--- stderr ---\n{r.stderr}"
+        proc.kill()
+        proc.wait(timeout=2)
+    rc = proc.returncode
+    return f"killed job {job_id} (pid {proc.pid}, rc={rc})"
 
 DISPATCH = {
     "read_file": tool_read_file,
@@ -188,16 +264,21 @@ DISPATCH = {
     "edit_file": tool_edit_file,
     "list_dir": tool_list_dir,
     "run_bash": tool_run_bash,
+    "monitor_bash": tool_monitor_bash,
+    "kill_bash": tool_kill_bash,
 }
 
-# required argument schema per tool: name -> {arg_name: type}
+# schema per tool: required + optional arg types. Extra args are dropped silently.
 _TOOL_SCHEMAS = {
-    "read_file":  {"path": str},
-    "write_file": {"path": str, "content": str},
-    "edit_file":  {"path": str, "old_string": str, "new_string": str},
-    "list_dir":   {"path": str},
-    "run_bash":   {"command": str},
+    "read_file":    {"req": {"path": str},                                                      "opt": {}},
+    "write_file":   {"req": {"path": str, "content": str},                                      "opt": {}},
+    "edit_file":    {"req": {"path": str, "old_string": str, "new_string": str},                "opt": {"replace_all": bool}},
+    "list_dir":     {"req": {"path": str},                                                      "opt": {}},
+    "run_bash":     {"req": {"command": str},                                                   "opt": {"background": bool}},
+    "monitor_bash": {"req": {"job_id": str},                                                    "opt": {"tail_lines": int}},
+    "kill_bash":    {"req": {"job_id": str},                                                    "opt": {}},
 }
+
 
 def _validate_tool_args(name, args):
     if name not in DISPATCH:
@@ -205,21 +286,28 @@ def _validate_tool_args(name, args):
     if not isinstance(args, dict):
         return f"args must be a JSON object, got {type(args).__name__}"
     schema = _TOOL_SCHEMAS[name]
-    for k, t in schema.items():
+    for k, t in schema["req"].items():
         if k not in args:
             return f"missing required arg '{k}' for {name}"
         if not isinstance(args[k], t):
             return f"arg '{k}' for {name} must be {t.__name__}, got {type(args[k]).__name__}"
         if t is str and not args[k]:
             return f"arg '{k}' for {name} must be non-empty"
+    for k, t in schema["opt"].items():
+        if k in args and not isinstance(args[k], t):
+            return f"optional arg '{k}' for {name} must be {t.__name__}, got {type(args[k]).__name__}"
     return None
+
 
 def call_tool(name, args):
     err = _validate_tool_args(name, args)
     if err:
         return f"ERROR: {err}"
+    schema = _TOOL_SCHEMAS[name]
+    valid_keys = set(schema["req"]) | set(schema["opt"])
+    safe_args = {k: v for k, v in args.items() if k in valid_keys}
     try:
-        return DISPATCH[name](**args)
+        return DISPATCH[name](**safe_args)
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
@@ -622,9 +710,9 @@ signal.signal(signal.SIGINT, _sigint_handler)
 # auto-edit: ask before run_bash, edits go through silently
 # yolo:      ask for nothing
 _TOOLS_NEEDING_CONFIRM = {
-    "safe": {"run_bash", "write_file", "edit_file"},
-    "auto-edit": {"run_bash"},
-    "yolo": set(),
+    "safe":      {"run_bash", "write_file", "edit_file", "kill_bash"},
+    "auto-edit": {"run_bash", "kill_bash"},
+    "yolo":      set(),
 }
 
 

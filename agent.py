@@ -1116,14 +1116,27 @@ async def main_async():
             return
         event.current_buffer.history_backward()
 
-    @kb.add("c-t")
-    def _(event):
-        # show last captured reasoning trace
+    async def _replay_thinking():
         rt = chat.get("last_reasoning", "")
         if not rt:
-            _msg(event, "\n(no reasoning captured for this turn — model may not emit it)")
-            return
-        _msg(event, f"\n--- thinking ({len(rt)} chars) ---\n{rt}\n--- end thinking ---")
+            sys.stdout.write("\n(no reasoning captured for this turn — model may not emit it)\n")
+            sys.stdout.flush(); return
+        sys.stdout.write(f"\n{_C['cyan']}╭─── thinking ({len(rt)} chars) ───{_C['reset']}\n"
+                         f"{_C['dim']}")
+        sys.stdout.flush()
+        # stream a few chars at a time so long traces don't take forever
+        chunk_size = 4
+        delay = 0.012
+        for i in range(0, len(rt), chunk_size):
+            sys.stdout.write(rt[i:i+chunk_size])
+            sys.stdout.flush()
+            await asyncio.sleep(delay)
+        sys.stdout.write(f"{_C['reset']}\n{_C['cyan']}╰─── end thinking ───{_C['reset']}\n")
+        sys.stdout.flush()
+
+    @kb.add("c-t", eager=True)
+    def _(event):
+        event.app.create_background_task(_replay_thinking())
 
     session = PromptSession(history=FileHistory(str(history_path)), key_bindings=kb)
 
@@ -1278,11 +1291,7 @@ async def main_async():
                             print("recalled — it'll appear in the next prompt to edit")
                         continue
                     if cmd in ("thinking", "think"):
-                        rt = chat.get("last_reasoning", "")
-                        if not rt:
-                            print("(no reasoning captured for the last turn — model may not emit it)")
-                        else:
-                            print(f"--- thinking ({len(rt)} chars) ---\n{rt}\n--- end thinking ---")
+                        await _replay_thinking()
                         continue
                     if cmd == "log":
                         arg = rest.strip()

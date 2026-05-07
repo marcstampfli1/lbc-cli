@@ -630,6 +630,7 @@ class LibreChatBackend:
         self.conversation_id = None
         self.parent_message_id = "00000000-0000-0000-0000-000000000000"
         self._first_turn = True
+        self.last_reasoning = ""  # captured from reasoning/thinking content parts
 
     def _refresh_token(self):
         # /api/auth/refresh exchanges the refreshToken cookie for a new access token
@@ -674,6 +675,9 @@ class LibreChatBackend:
         """Yield text deltas as the model generates. LibreChat events sometimes
         carry the cumulative text rather than a delta — we diff against what we've
         seen so far either way."""
+        # reset per-turn reasoning state
+        self.last_reasoning = ""
+        self._reasoning_started = False
         latest_user = next(m for m in reversed(messages) if m["role"] == "user")
         text = latest_user["content"]
         if self._first_turn and messages and messages[0]["role"] == "system":
@@ -741,17 +745,36 @@ class LibreChatBackend:
                     final_event = obj
                     break
                 # current LibreChat: {"event": "on_message_delta", "data": {"delta": {"content": [{"type":"text","text":"..."}]}}}
-                if obj.get("event") == "on_message_delta":
+                if obj.get("event") in ("on_message_delta", "on_reasoning_delta"):
                     data = obj.get("data") or {}
                     delta = data.get("delta") or {}
                     content = delta.get("content") or []
                     if isinstance(content, list):
                         for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                chunk = part.get("text") or ""
-                                if chunk:
-                                    seen_text += chunk
-                                    yield chunk
+                            if not isinstance(part, dict):
+                                continue
+                            ptype = part.get("type", "")
+                            chunk = (part.get("text") or part.get("reasoning") or
+                                     part.get("thinking") or "")
+                            if not chunk:
+                                continue
+                            if ptype in ("reasoning", "thinking"):
+                                # stream live in dim color, also buffer for /thinking
+                                self.last_reasoning += chunk
+                                if not self._reasoning_started:
+                                    sys.stdout.write(f"\n{_C['cyan']}── thinking ──{_C['reset']}\n"
+                                                     f"{_C['dim']}")
+                                    self._reasoning_started = True
+                                sys.stdout.write(chunk)
+                                sys.stdout.flush()
+                            else:
+                                if self._reasoning_started:
+                                    sys.stdout.write(f"{_C['reset']}\n"
+                                                     f"{_C['cyan']}── answer ──{_C['reset']}\n")
+                                    sys.stdout.flush()
+                                    self._reasoning_started = False
+                                seen_text += chunk
+                                yield chunk
                     continue
                 # legacy: top-level 'text' field (older LibreChat versions / some endpoints)
                 t = obj.get("text")
@@ -765,15 +788,27 @@ class LibreChatBackend:
                     if d:
                         yield d
 
+        # close any still-open thinking section
+        if self._reasoning_started:
+            sys.stdout.write(f"{_C['reset']}\n"); sys.stdout.flush()
+            self._reasoning_started = False
+
         if final_event:
             resp = final_event.get("responseMessage") or {}
             self.parent_message_id = resp.get("messageId", self.parent_message_id)
             final_text = resp.get("text") or ""
             if not final_text:
                 for part in resp.get("content", []) or []:
-                    if part.get("type") == "text":
+                    ptype = part.get("type")
+                    if ptype == "text":
                         final_text += part.get("text", "")
-                    elif part.get("type") == "error":
+                    elif ptype in ("reasoning", "thinking"):
+                        # final event may carry the full reasoning even if it
+                        # wasn't streamed via deltas
+                        rt = part.get("text") or part.get("reasoning") or part.get("thinking") or ""
+                        if rt and rt not in self.last_reasoning:
+                            self.last_reasoning = rt
+                    elif ptype == "error":
                         final_text = f"[LibreChat error] {part.get('error')}"
             # if we streamed less than the final, emit the remainder
             if final_text.startswith(seen_text):
@@ -796,8 +831,8 @@ from datetime import datetime
 # --- diff rendering for file edits ---
 _ANSI = sys.stdout.isatty()
 _C = {"red": "\x1b[31m", "green": "\x1b[32m", "cyan": "\x1b[36m",
-      "bold": "\x1b[1m", "reset": "\x1b[0m"} if _ANSI else \
-     {k: "" for k in ("red", "green", "cyan", "bold", "reset")}
+      "dim": "\x1b[2m", "bold": "\x1b[1m", "reset": "\x1b[0m"} if _ANSI else \
+     {k: "" for k in ("red", "green", "cyan", "dim", "bold", "reset")}
 
 
 def _render_diff(old_text, new_text, path, max_lines=120):
@@ -1022,7 +1057,7 @@ async def main_async():
         """Print a message above the prompt (works while prompt is active)."""
         sys.stdout.write(text + "\n"); sys.stdout.flush()
 
-    @kb.add("c-o")
+    @kb.add("c-o", eager=True)
     def _(event):
         p = _LAST_FG_LOG[0]
         if not p or not p.exists():
@@ -1031,7 +1066,7 @@ async def main_async():
         text = p.read_text(errors="replace")
         _msg(event, f"\n--- {p} ---\n{text}--- end log ({len(text.splitlines())} lines) ---")
 
-    @kb.add("c-b")
+    @kb.add("c-b", eager=True)
     def _(event):
         if _CURRENT_FG.get("proc") is None:
             _msg(event, "\n(no foreground command running)")
@@ -1039,15 +1074,15 @@ async def main_async():
         _FG_BG_REQUESTED.set()
         _msg(event, "\n[Ctrl+B] requesting backgrounding of current foreground command...")
 
-    @kb.add("c-c")
+    @kb.add("c-c", eager=True)
     def _(event):
         now = time.monotonic()
         is_double = (now - _last_sigint[0]) < 1.5
         _last_sigint[0] = now
         if is_double:
-            event.app.exit(exception=KeyboardInterrupt)
-            return
-        # single-tap priority: kill fg → interrupt agent → clear buffer → hint
+            # hard-exit so we actually quit the program, not just the prompt
+            sys.stdout.write("\n(double Ctrl-C — exiting)\n"); sys.stdout.flush()
+            os._exit(130)
         proc = _CURRENT_FG.get("proc")
         if proc is not None:
             try: proc.terminate()
@@ -1063,9 +1098,8 @@ async def main_async():
             return
         _msg(event, "\n(Ctrl+C — press again quickly to exit)")
 
-    @kb.add("c-j")
+    @kb.add("c-j", eager=True)
     def _(event):
-        # push a sentinel that the main loop will resolve to an interactive menu
         pending.append("__JOBS_MENU__")
         new_input_evt.set()
         if not busy[0]:
@@ -1081,6 +1115,15 @@ async def main_async():
             event.current_buffer.document = Document(text=text, cursor_position=len(text))
             return
         event.current_buffer.history_backward()
+
+    @kb.add("c-t")
+    def _(event):
+        # show last captured reasoning trace
+        rt = chat.get("last_reasoning", "")
+        if not rt:
+            _msg(event, "\n(no reasoning captured for this turn — model may not emit it)")
+            return
+        _msg(event, f"\n--- thinking ({len(rt)} chars) ---\n{rt}\n--- end thinking ---")
 
     session = PromptSession(history=FileHistory(str(history_path)), key_bindings=kb)
 
@@ -1314,6 +1357,8 @@ async def main_async():
                         if isinstance(backend, LibreChatBackend):
                             chat["conversation_id"] = backend.conversation_id
                             chat["parent_message_id"] = backend.parent_message_id
+                            if backend.last_reasoning:
+                                chat["last_reasoning"] = backend.last_reasoning
 
                         calls = extract_tool_calls(assistant_text)
                         if not calls:

@@ -8,13 +8,16 @@ the backend supports OpenAI tool definitions.
 import json
 import os
 import re
+import select
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 
 import httpx
+import readline  # noqa: F401 — gives input() arrow-up history + line editing
 from dotenv import load_dotenv
 
 # tolerate bad bytes from terminal pastes / non-UTF-8 locales
@@ -800,6 +803,63 @@ def _show_diff_for(name, ar):
 
 CHATS_DIR = CONFIG_DIR / "chats"
 
+# --- async input queue ---
+# Lets the user type messages while the agent is busy. Queued messages
+# auto-flush at the next turn boundary. /recall pops the newest queued back
+# into the prompt buffer for editing.
+_QUEUE = []                       # list[str] — queued user lines
+_QUEUE_LOCK = threading.Lock()
+_AGENT_BUSY = threading.Event()
+_RECALL_TEXT = [""]               # one-shot text to inject into next input()
+
+
+def _queue_reader_thread():
+    """Daemon: poll stdin while agent is busy, append non-empty lines to queue."""
+    while True:
+        if not _AGENT_BUSY.is_set():
+            time.sleep(0.05)
+            continue
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], 0.2)
+        except OSError:
+            return
+        if not r or not _AGENT_BUSY.is_set():
+            continue
+        try:
+            line = sys.stdin.readline()
+        except (OSError, ValueError):
+            return
+        if not line:
+            return  # stdin closed
+        line = line.rstrip("\n").strip()
+        if not line:
+            continue
+        with _QUEUE_LOCK:
+            _QUEUE.append(line)
+            n = len(_QUEUE)
+        sys.stdout.write(f"\n  [queued #{n}: {line[:80]}{'...' if len(line) > 80 else ''}] "
+                         f"(/recall to edit, /queue to view)\n")
+        sys.stdout.flush()
+
+
+def _drain_queue_one():
+    with _QUEUE_LOCK:
+        if not _QUEUE:
+            return None
+        return _QUEUE.pop(0)
+
+
+def _readline_pre_input_hook():
+    """If text was set via /recall, pre-fill the next input() with it."""
+    if _RECALL_TEXT[0]:
+        readline.insert_text(_RECALL_TEXT[0])
+        readline.redisplay()
+        _RECALL_TEXT[0] = ""
+
+
+readline.set_pre_input_hook(_readline_pre_input_hook)
+threading.Thread(target=_queue_reader_thread, daemon=True).start()
+
 # --- ctrl-c double-tap: single = interrupt, double (within 1.5s) = exit ---
 _last_sigint = [0.0]
 def _sigint_handler(signum, frame):
@@ -942,13 +1002,19 @@ def main():
 
     messages = chat["messages"]
     while True:
-        try:
-            user = input("> ").strip()
-        except EOFError:
-            print(); return
-        except KeyboardInterrupt:
-            # at the prompt, single Ctrl-C clears the line; double-tap is handled by handler
-            print(); continue
+        # auto-flush any queued messages first (they came in while agent was busy)
+        queued = _drain_queue_one()
+        if queued is not None:
+            print(f"> {queued}   [auto-sent from queue]")
+            user = queued
+        else:
+            try:
+                user = input("> ").strip()
+            except EOFError:
+                print(); return
+            except KeyboardInterrupt:
+                # at the prompt, single Ctrl-C clears the line; double-tap is handled by handler
+                print(); continue
         if not user:
             continue
 
@@ -965,7 +1031,11 @@ def main():
                       "  /kill <id>     kill a background job\n"
                       "  /log [id]      show full log (fg if no id, else bg job id)\n"
                       "  /logs          list all saved logs\n"
-                      "  /exit          quit")
+                      "  /queue         show queued messages (typed while agent was busy)\n"
+                      "  /recall        pull the most recent queued msg into the prompt to edit\n"
+                      "  /exit          quit\n"
+                      "controls: Ctrl-C interrupts agent; arrow-up at the prompt = history;\n"
+                      "          typing while agent is busy queues; queue auto-sends after.")
                 continue
             if cmd == "jobs":
                 print(tool_list_bg_jobs())
@@ -976,6 +1046,23 @@ def main():
                     print("usage: /kill <job_id>")
                 else:
                     print(tool_kill_bash(jid))
+                continue
+            if cmd == "queue":
+                with _QUEUE_LOCK:
+                    if not _QUEUE:
+                        print("(no queued messages)")
+                    else:
+                        for i, q in enumerate(_QUEUE, 1):
+                            print(f"  {i}. {q}")
+                continue
+            if cmd == "recall":
+                with _QUEUE_LOCK:
+                    if not _QUEUE:
+                        print("(nothing to recall)")
+                        continue
+                    text = _QUEUE.pop()
+                _RECALL_TEXT[0] = text
+                print(f"recalled — edit and press Enter (or Ctrl-C to cancel):")
                 continue
             if cmd == "log":
                 arg = rest.strip()
@@ -1059,6 +1146,7 @@ def main():
                 send_messages = list(messages)
                 send_messages.insert(-1, {"role": "system", "content": TOOL_REMINDER})
 
+        _AGENT_BUSY.set()
         try:
             for _ in range(20):
                 # stream the assistant turn
@@ -1107,6 +1195,12 @@ def main():
             # also drop the user msg we appended this turn so retry feels clean
             if messages and messages[-1]["role"] == "user":
                 messages.pop()
+        finally:
+            _AGENT_BUSY.clear()
+            with _QUEUE_LOCK:
+                pending = len(_QUEUE)
+            if pending:
+                print(f"  [{pending} queued message{'s' if pending > 1 else ''} will auto-send]")
 
         _save_chat(chat)
 

@@ -550,14 +550,14 @@ class OpenAIBackend:
         self.model = AGENT_MODEL
 
     def send_stream(self, messages):
-        """Yield text chunks. Caller accumulates."""
+        """Yield ('text', chunk) tuples. (OpenAI-compat doesn't expose reasoning.)"""
         stream = self.client.chat.completions.create(
             model=self.model, messages=messages, stream=True,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                yield delta
+                yield ("text", delta)
 
 
 def _find_token_in_storage(state):
@@ -672,12 +672,11 @@ class LibreChatBackend:
         Path(SESSION_FILE).write_text(json.dumps(state, indent=2))
 
     def send_stream(self, messages):
-        """Yield text deltas as the model generates. LibreChat events sometimes
-        carry the cumulative text rather than a delta — we diff against what we've
-        seen so far either way."""
-        # reset per-turn reasoning state
+        """Yield (kind, chunk) tuples — kind is 'text' or 'reasoning'. Reasoning
+        chunks come from on_reasoning_delta or content parts with type 'reasoning'/
+        'thinking'. Caller is responsible for displaying both. Side effect:
+        backend.last_reasoning accumulates the reasoning trace for /thinking recall."""
         self.last_reasoning = ""
-        self._reasoning_started = False
         latest_user = next(m for m in reversed(messages) if m["role"] == "user")
         text = latest_user["content"]
         if self._first_turn and messages and messages[0]["role"] == "system":
@@ -745,6 +744,7 @@ class LibreChatBackend:
                     final_event = obj
                     break
                 # current LibreChat: {"event": "on_message_delta", "data": {"delta": {"content": [{"type":"text","text":"..."}]}}}
+                # reasoning models also emit on_reasoning_delta with similar shape
                 if obj.get("event") in ("on_message_delta", "on_reasoning_delta"):
                     data = obj.get("data") or {}
                     delta = data.get("delta") or {}
@@ -759,22 +759,12 @@ class LibreChatBackend:
                             if not chunk:
                                 continue
                             if ptype in ("reasoning", "thinking"):
-                                # stream live in dim color, also buffer for /thinking
                                 self.last_reasoning += chunk
-                                if not self._reasoning_started:
-                                    sys.stdout.write(f"\n{_C['cyan']}── thinking ──{_C['reset']}\n"
-                                                     f"{_C['dim']}")
-                                    self._reasoning_started = True
-                                sys.stdout.write(chunk)
-                                sys.stdout.flush()
-                            else:
-                                if self._reasoning_started:
-                                    sys.stdout.write(f"{_C['reset']}\n"
-                                                     f"{_C['cyan']}── answer ──{_C['reset']}\n")
-                                    sys.stdout.flush()
-                                    self._reasoning_started = False
+                                yield ("reasoning", chunk)
+                            elif ptype == "text" or ptype == "":
                                 seen_text += chunk
-                                yield chunk
+                                yield ("text", chunk)
+                            # ignore unknown ptypes (tool_use, etc.)
                     continue
                 # legacy: top-level 'text' field (older LibreChat versions / some endpoints)
                 t = obj.get("text")
@@ -786,12 +776,7 @@ class LibreChatBackend:
                         d = t
                         seen_text += t
                     if d:
-                        yield d
-
-        # close any still-open thinking section
-        if self._reasoning_started:
-            sys.stdout.write(f"{_C['reset']}\n"); sys.stdout.flush()
-            self._reasoning_started = False
+                        yield ("text", d)
 
         if final_event:
             resp = final_event.get("responseMessage") or {}
@@ -799,24 +784,16 @@ class LibreChatBackend:
             final_text = resp.get("text") or ""
             if not final_text:
                 for part in resp.get("content", []) or []:
-                    ptype = part.get("type")
-                    if ptype == "text":
+                    if part.get("type") == "text":
                         final_text += part.get("text", "")
-                    elif ptype in ("reasoning", "thinking"):
-                        # final event may carry the full reasoning even if it
-                        # wasn't streamed via deltas
-                        rt = part.get("text") or part.get("reasoning") or part.get("thinking") or ""
-                        if rt and rt not in self.last_reasoning:
-                            self.last_reasoning = rt
-                    elif ptype == "error":
+                    elif part.get("type") == "error":
                         final_text = f"[LibreChat error] {part.get('error')}"
-            # if we streamed less than the final, emit the remainder
             if final_text.startswith(seen_text):
                 tail = final_text[len(seen_text):]
                 if tail:
-                    yield tail
+                    yield ("text", tail)
             elif not seen_text and final_text:
-                yield final_text
+                yield ("text", final_text)
 
 
 # --- chat session persistence ---
@@ -1116,27 +1093,13 @@ async def main_async():
             return
         event.current_buffer.history_backward()
 
-    async def _replay_thinking():
-        rt = chat.get("last_reasoning", "")
-        if not rt:
-            sys.stdout.write("\n(no reasoning captured for this turn — model may not emit it)\n")
-            sys.stdout.flush(); return
-        sys.stdout.write(f"\n{_C['cyan']}╭─── thinking ({len(rt)} chars) ───{_C['reset']}\n"
-                         f"{_C['dim']}")
-        sys.stdout.flush()
-        # stream a few chars at a time so long traces don't take forever
-        chunk_size = 4
-        delay = 0.012
-        for i in range(0, len(rt), chunk_size):
-            sys.stdout.write(rt[i:i+chunk_size])
-            sys.stdout.flush()
-            await asyncio.sleep(delay)
-        sys.stdout.write(f"{_C['reset']}\n{_C['cyan']}╰─── end thinking ───{_C['reset']}\n")
-        sys.stdout.flush()
-
     @kb.add("c-t", eager=True)
     def _(event):
-        event.app.create_background_task(_replay_thinking())
+        rt = chat.get("last_reasoning", "")
+        if not rt:
+            _msg(event, "\n(no reasoning captured for this turn)")
+            return
+        _msg(event, f"\n--- thinking ({len(rt)} chars) ---\n{rt}\n--- end ---")
 
     session = PromptSession(history=FileHistory(str(history_path)), key_bindings=kb)
 
@@ -1291,7 +1254,11 @@ async def main_async():
                             print("recalled — it'll appear in the next prompt to edit")
                         continue
                     if cmd in ("thinking", "think"):
-                        await _replay_thinking()
+                        rt = chat.get("last_reasoning", "")
+                        if not rt:
+                            print("(no reasoning captured)")
+                        else:
+                            print(f"--- thinking ({len(rt)} chars) ---\n{rt}\n--- end ---")
                         continue
                     if cmd == "log":
                         arg = rest.strip()
@@ -1363,12 +1330,30 @@ async def main_async():
                         if interrupt_flag[0]:
                             raise KeyboardInterrupt
                         assistant_text = ""
+                        in_reasoning = False
                         print()
-                        async for delta in _stream_to_async(backend.send_stream(send_messages)):
+                        async for item in _stream_to_async(backend.send_stream(send_messages)):
                             if interrupt_flag[0]:
                                 raise KeyboardInterrupt
-                            sys.stdout.write(delta); sys.stdout.flush()
-                            assistant_text += delta
+                            # backwards-compat: backends now yield (kind, chunk); accept plain str too
+                            if isinstance(item, tuple) and len(item) == 2:
+                                kind, chunk = item
+                            else:
+                                kind, chunk = "text", str(item)
+                            if kind == "reasoning":
+                                if not in_reasoning:
+                                    sys.stdout.write(f"\n{_C['cyan']}── thinking ──{_C['reset']}\n{_C['dim']}")
+                                    in_reasoning = True
+                                sys.stdout.write(chunk); sys.stdout.flush()
+                            else:
+                                if in_reasoning:
+                                    sys.stdout.write(f"{_C['reset']}\n{_C['cyan']}── answer ──{_C['reset']}\n")
+                                    sys.stdout.flush()
+                                    in_reasoning = False
+                                sys.stdout.write(chunk); sys.stdout.flush()
+                                assistant_text += chunk
+                        if in_reasoning:
+                            sys.stdout.write(f"{_C['reset']}\n"); sys.stdout.flush()
                         print()
                         messages.append({"role": "assistant", "content": assistant_text})
                         if isinstance(backend, LibreChatBackend):

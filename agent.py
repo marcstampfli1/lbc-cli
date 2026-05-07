@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -186,6 +187,7 @@ def tool_list_dir(path):
 
 _BG_JOBS_DIR = Path("/tmp/cli-agent-jobs")
 _BG_JOBS = {}  # job_id -> {"proc": Popen, "log": Path, "command": str, "started": float}
+_LAST_FG_LOG = [None]  # Path | None; set after each foreground run_bash
 
 
 def _tail_file(path, n):
@@ -197,34 +199,84 @@ def _tail_file(path, n):
     return "\n".join(lines[-n:]) if lines else "(empty)"
 
 
+def _cap_for_model(text, max_lines=200, max_bytes=8000, log_path=None):
+    """Trim live output before it goes back to the model. Always include the
+    last lines (most relevant) and a hint about the log file for full output."""
+    lines = text.splitlines(keepends=True)
+    if len(lines) <= max_lines and len(text) <= max_bytes:
+        return text
+    head = "".join(lines[:max_lines // 2])
+    tail = "".join(lines[-max_lines // 2:])
+    note = (f"\n--- output truncated ({len(lines)} lines, {len(text)} bytes) "
+            f"— full log at {log_path} ---\n" if log_path else
+            f"\n--- output truncated ({len(lines)} lines) ---\n")
+    return head + note + tail
+
+
+def _run_fg(command):
+    """Foreground bash: stream stdout+stderr to the terminal live, save full
+    output to a log file, return a (capped) result string for the model."""
+    import threading
+    _BG_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _BG_JOBS_DIR / f"fg-{int(time.time())}-{uuid.uuid4().hex[:6]}.log"
+    _LAST_FG_LOG[0] = log_path
+
+    proc = subprocess.Popen(
+        command, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    captured = []
+    log_fd = log_path.open("w")
+    timed_out = [False]
+
+    def killer():
+        if not stop_evt.wait(60):
+            if proc.poll() is None:
+                timed_out[0] = True
+                try: proc.terminate()
+                except Exception: pass
+
+    stop_evt = threading.Event()
+    t = threading.Thread(target=killer, daemon=True)
+    t.start()
+
+    prefix = f"{_C['cyan']}  | {_C['reset']}"
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(prefix + line)
+            sys.stdout.flush()
+            captured.append(line)
+            log_fd.write(line)
+            log_fd.flush()
+    except KeyboardInterrupt:
+        stop_evt.set()
+        try: proc.terminate()
+        except Exception: pass
+        try: proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try: proc.kill()
+            except Exception: pass
+        log_fd.close()
+        raise
+    finally:
+        stop_evt.set()
+        proc.wait()
+        log_fd.close()
+
+    output = "".join(captured)
+    if timed_out[0]:
+        return (f"ERROR: foreground command timed out after 60s and was killed. "
+                f"Use background=true for long-running jobs.\n"
+                f"log: {log_path}\n"
+                f"--- captured output ---\n{_cap_for_model(output, log_path=log_path)}")
+    return (f"exit={proc.returncode}  log={log_path}\n"
+            f"--- output ---\n{_cap_for_model(output, log_path=log_path)}")
+
+
 def tool_run_bash(command, background=False):
     if not background:
-        # Popen so we can clean up on Ctrl-C or timeout instead of leaving zombies
-        proc = subprocess.Popen(
-            command, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except KeyboardInterrupt:
-            proc.terminate()
-            try:
-                stdout, stderr = proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-            raise  # let the agent loop catch it like any other interrupt
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                stdout, stderr = proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-            return (f"ERROR: foreground command timed out after 60s and was killed. "
-                    f"Use background=true for long-running jobs.\n"
-                    f"--- partial stdout ---\n{stdout}--- partial stderr ---\n{stderr}")
-        return f"exit={proc.returncode}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
+        return _run_fg(command)
 
     # background mode
     import time as _time
@@ -911,6 +963,8 @@ def main():
                       "  /mode <m>      change permission mode (safe|auto-edit|yolo)\n"
                       "  /jobs          list background jobs\n"
                       "  /kill <id>     kill a background job\n"
+                      "  /log [id]      show full log (fg if no id, else bg job id)\n"
+                      "  /logs          list all saved logs\n"
                       "  /exit          quit")
                 continue
             if cmd == "jobs":
@@ -922,6 +976,50 @@ def main():
                     print("usage: /kill <job_id>")
                 else:
                     print(tool_kill_bash(jid))
+                continue
+            if cmd == "log":
+                arg = rest.strip()
+                if not arg:
+                    p = _LAST_FG_LOG[0]
+                    if not p or not p.exists():
+                        print("(no foreground log yet)")
+                        continue
+                    print(f"--- {p} ---")
+                    print(p.read_text(errors="replace"))
+                else:
+                    # accept short bg id, fg-prefix, or full path
+                    candidates = [
+                        _BG_JOBS_DIR / f"{arg}.log",
+                        _BG_JOBS_DIR / arg,
+                        Path(arg),
+                    ]
+                    matches = list(_BG_JOBS_DIR.glob(f"{arg}*.log")) if _BG_JOBS_DIR.exists() else []
+                    p = next((c for c in candidates if c.exists()), None)
+                    if not p and matches:
+                        p = matches[0]
+                    if not p:
+                        print(f"no log found for '{arg}' "
+                              f"(checked {_BG_JOBS_DIR}/<id>.log and prefix matches)")
+                    else:
+                        print(f"--- {p} ---")
+                        print(p.read_text(errors="replace"))
+                continue
+            if cmd == "logs":
+                # list all logs in the jobs dir
+                if not _BG_JOBS_DIR.exists():
+                    print("(no logs)")
+                    continue
+                entries = sorted(_BG_JOBS_DIR.glob("*.log"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+                if not entries:
+                    print("(no logs)")
+                    continue
+                for p in entries[:30]:
+                    sz = p.stat().st_size
+                    age = int(time.time() - p.stat().st_mtime)
+                    print(f"  {p.name:<30}  {sz:>8}b  {age}s ago")
+                if len(entries) > 30:
+                    print(f"  ... ({len(entries) - 30} more)")
                 continue
             if cmd == "name":
                 chat["name"] = rest.strip() or chat["name"]

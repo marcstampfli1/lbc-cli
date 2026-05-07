@@ -194,6 +194,10 @@ _BG_JOBS_DIR = Path("/tmp/cli-agent-jobs")
 _BG_JOBS = {}  # job_id -> {"proc": Popen, "log": Path, "command": str, "started": float}
 _LAST_FG_LOG = [None]  # Path | None; set after each foreground run_bash
 
+# tracks the *currently-running* foreground command so keybindings can act on it
+_CURRENT_FG = {"proc": None, "log": None, "command": None, "started": 0.0}
+_FG_BG_REQUESTED = threading.Event()  # set by Ctrl+B; _run_fg detaches when it sees it
+
 
 def _tail_file(path, n):
     try:
@@ -220,8 +224,8 @@ def _cap_for_model(text, max_lines=2000, max_bytes=200_000, log_path=None):
 
 def _run_fg(command):
     """Foreground bash: stream stdout+stderr to the terminal live, save full
-    output to a log file, return a (capped) result string for the model."""
-    import threading
+    output to a log file, return a (capped) result string for the model.
+    If Ctrl+B is pressed (sets _FG_BG_REQUESTED), detach and continue in bg."""
     _BG_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _BG_JOBS_DIR / f"fg-{int(time.time())}-{uuid.uuid4().hex[:6]}.log"
     _LAST_FG_LOG[0] = log_path
@@ -234,26 +238,62 @@ def _run_fg(command):
     captured = []
     log_fd = log_path.open("w")
     timed_out = [False]
+    backgrounded = [False]
+
+    _CURRENT_FG.update(proc=proc, log=log_path, command=command, started=time.time())
+    _FG_BG_REQUESTED.clear()
+
+    stop_evt = threading.Event()
 
     def killer():
         if not stop_evt.wait(60):
-            if proc.poll() is None:
+            if proc.poll() is None and not backgrounded[0]:
                 timed_out[0] = True
                 try: proc.terminate()
                 except Exception: pass
 
-    stop_evt = threading.Event()
-    t = threading.Thread(target=killer, daemon=True)
-    t.start()
+    threading.Thread(target=killer, daemon=True).start()
+
+    def takeover_thread(proc, log_fd):
+        """After backgrounding: keep reading stdout, dump to log, until exit."""
+        try:
+            for line in proc.stdout:
+                log_fd.write(line); log_fd.flush()
+        except Exception:
+            pass
+        finally:
+            try: log_fd.close()
+            except Exception: pass
+            try: proc.wait()
+            except Exception: pass
 
     prefix = f"{_C['cyan']}  | {_C['reset']}"
     try:
         for line in proc.stdout:
-            sys.stdout.write(prefix + line)
-            sys.stdout.flush()
+            if _FG_BG_REQUESTED.is_set():
+                # detach: register as bg job, hand the proc + log_fd to takeover thread
+                _FG_BG_REQUESTED.clear()
+                bg_id = uuid.uuid4().hex[:8]
+                _BG_JOBS[bg_id] = {
+                    "proc": proc, "log": log_path, "command": command,
+                    "started": _CURRENT_FG["started"], "log_fd": log_fd,
+                }
+                threading.Thread(target=takeover_thread, args=(proc, log_fd), daemon=True).start()
+                backgrounded[0] = True
+                stop_evt.set()  # tell killer to stop watching this proc
+                # write the line that triggered the check (already read from pipe)
+                log_fd.write(line); log_fd.flush()
+                captured.append(line)
+                sys.stdout.write(prefix + line); sys.stdout.flush()
+                output = "".join(captured)
+                return (f"foreground command MOVED TO BACKGROUND as {bg_id}\n"
+                        f"log: {log_path}\n"
+                        f"command: {command}\n"
+                        f"--- output so far ---\n{_cap_for_model(output, log_path=log_path)}\n"
+                        f"--- (still running — use monitor_bash('{bg_id}') / kill_bash) ---")
+            sys.stdout.write(prefix + line); sys.stdout.flush()
             captured.append(line)
-            log_fd.write(line)
-            log_fd.flush()
+            log_fd.write(line); log_fd.flush()
     except KeyboardInterrupt:
         stop_evt.set()
         try: proc.terminate()
@@ -263,11 +303,14 @@ def _run_fg(command):
             try: proc.kill()
             except Exception: pass
         log_fd.close()
+        _CURRENT_FG.update(proc=None, log=None, command=None)
         raise
     finally:
-        stop_evt.set()
-        proc.wait()
-        log_fd.close()
+        if not backgrounded[0]:
+            stop_evt.set()
+            proc.wait()
+            log_fd.close()
+            _CURRENT_FG.update(proc=None, log=None, command=None)
 
     output = "".join(captured)
     if timed_out[0]:
@@ -964,12 +1007,75 @@ async def main_async():
 
     history_path = CONFIG_DIR / "input_history"
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    session = PromptSession(history=FileHistory(str(history_path)))
 
     pending: "deque[str]" = deque()
     new_input_evt = asyncio.Event()
     busy = [False]
     input_task_holder = [None]  # asyncio.Task
+
+    # custom keybindings (Ctrl+O, Ctrl+B, Ctrl+C, Ctrl+J, arrow-up-recall)
+    from prompt_toolkit.key_binding import KeyBindings
+    kb = KeyBindings()
+
+    def _msg(event, text):
+        """Print a message above the prompt (works while prompt is active)."""
+        sys.stdout.write(text + "\n"); sys.stdout.flush()
+
+    @kb.add("c-o")
+    def _(event):
+        p = _LAST_FG_LOG[0]
+        if not p or not p.exists():
+            _msg(event, "\n(no foreground log yet)")
+            return
+        text = p.read_text(errors="replace")
+        _msg(event, f"\n--- {p} ---\n{text}--- end log ({len(text.splitlines())} lines) ---")
+
+    @kb.add("c-b")
+    def _(event):
+        if _CURRENT_FG.get("proc") is None:
+            _msg(event, "\n(no foreground command running)")
+            return
+        _FG_BG_REQUESTED.set()
+        _msg(event, "\n[Ctrl+B] requesting backgrounding of current foreground command...")
+
+    @kb.add("c-c")
+    def _(event):
+        proc = _CURRENT_FG.get("proc")
+        if proc is not None:
+            try: proc.terminate()
+            except Exception: pass
+            _msg(event, "\n[Ctrl+C] terminated foreground command")
+            return
+        # default-ish behavior: clear the input line, or exit on double-tap
+        now = time.monotonic()
+        if event.current_buffer.text:
+            event.current_buffer.reset()
+            return
+        if now - _last_sigint[0] < 1.5:
+            event.app.exit(exception=KeyboardInterrupt)
+        _last_sigint[0] = now
+
+    @kb.add("c-j")
+    def _(event):
+        # push a sentinel that the main loop will resolve to an interactive menu
+        pending.append("__JOBS_MENU__")
+        new_input_evt.set()
+        if not busy[0]:
+            event.app.exit(result="")
+
+    @kb.add("up")
+    def _(event):
+        # if there's a queued message, recall the newest one into the buffer.
+        # otherwise fall through to history navigation
+        if pending:
+            text = pending.pop()
+            buf = event.current_buffer
+            buf.text = text
+            buf.cursor_position = len(text)
+        else:
+            event.current_buffer.history_backward()
+
+    session = PromptSession(history=FileHistory(str(history_path)), key_bindings=kb)
 
     async def input_loop():
         """Always running — feeds 'pending' deque. Cancelled briefly during confirm."""
@@ -1037,6 +1143,47 @@ async def main_async():
                 if user is None:  # EOF sentinel
                     return
 
+                if user == "__JOBS_MENU__":
+                    # interactive jobs menu (triggered by Ctrl+J)
+                    while True:
+                        items = list(_BG_JOBS.items())
+                        if not items:
+                            print("\n(no background jobs)")
+                            break
+                        print("\nbackground jobs:")
+                        for i, (jid, job) in enumerate(items, 1):
+                            rc = job["proc"].poll()
+                            status = "running" if rc is None else f"exited (rc={rc})"
+                            elapsed = int(time.time() - job["started"])
+                            print(f"  {i}. {jid}  {status:<18} {elapsed:>4}s  {job['command'][:60]}")
+                        try:
+                            ans = await session.prompt_async(
+                                "action: [v <n> view, k <n> kill, q quit] > ")
+                        except (EOFError, KeyboardInterrupt):
+                            break
+                        ans = ans.strip()
+                        if not ans or ans == "q":
+                            break
+                        parts = ans.split(maxsplit=1)
+                        op = parts[0]
+                        if len(parts) < 2:
+                            print("  (need a job number, e.g. 'v 1')"); continue
+                        try:
+                            n = int(parts[1])
+                        except ValueError:
+                            print("  (number please)"); continue
+                        if not 1 <= n <= len(items):
+                            print(f"  (out of range — pick 1..{len(items)})"); continue
+                        jid, job = items[n - 1]
+                        if op == "v":
+                            print(f"--- {job['log']} (last 50 lines) ---")
+                            print(_tail_file(job["log"], 50))
+                        elif op == "k":
+                            print(tool_kill_bash(jid))
+                        else:
+                            print("  (use v or k)")
+                    continue
+
                 if user.startswith("/"):
                     cmd, _, rest = user[1:].partition(" ")
                     if cmd in ("exit", "quit"):
@@ -1053,9 +1200,13 @@ async def main_async():
                               "  /queue         show queued messages\n"
                               "  /recall        pop newest queued message into prompt for editing\n"
                               "  /exit          quit\n"
-                              "controls: Ctrl-C interrupts agent / clears prompt; double-tap exits.\n"
-                              "          arrow-up at prompt = history; typing while agent is busy\n"
-                              "          queues the line — auto-flushed when the turn ends.")
+                              "keys:\n"
+                              "  Ctrl+C   kill running fg command, or clear prompt, or (double-tap) exit\n"
+                              "  Ctrl+O   show full log of last foreground command\n"
+                              "  Ctrl+B   move running fg command to background (then continue chatting)\n"
+                              "  Ctrl+J   open interactive background-jobs menu (view/kill)\n"
+                              "  Up arrow recall newest queued msg if any, else browse history\n"
+                              "  type while busy → line is queued, auto-sent at next turn boundary")
                         continue
                     if cmd == "jobs":      print(tool_list_bg_jobs()); continue
                     if cmd == "kill":

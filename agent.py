@@ -199,7 +199,7 @@ def _tail_file(path, n):
     return "\n".join(lines[-n:]) if lines else "(empty)"
 
 
-def _cap_for_model(text, max_lines=200, max_bytes=8000, log_path=None):
+def _cap_for_model(text, max_lines=2000, max_bytes=200_000, log_path=None):
     """Trim live output before it goes back to the model. Always include the
     last lines (most relevant) and a hint about the log file for full output."""
     lines = text.splitlines(keepends=True)
